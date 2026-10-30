@@ -5,8 +5,9 @@
 #   3. the push of the tag starts release.yml, which publishes to npm through trusted publishing.
 # The commit and the tag are pushed together (atomically) with a deploy key (secret RELEASE_DEPLOY_KEY of the `version`
 # environment, which only main may use): unlike the workflow's own token, a deploy key's push starts other workflows,
-# and it sits on main's ruleset bypass list. The key is loaded only for the push, which runs no git hooks, so no code
-# installed earlier in the job runs while it is present.
+# and it sits on main's ruleset bypass list. The key is written only in the push step, which runs no git hooks. That
+# narrows but does not close one path: a compromised dependency run earlier in the job (changeset, vp) could rewrite
+# .git/config to run code at push time. Pushing from a separate job that installs nothing would close it.
 # The release commit's own `check` run finds no changesets.
 # Adapted from file-transfer's release workflow (phibkro/file-transfer, docs/decisions/0023), same author.
 name: version
