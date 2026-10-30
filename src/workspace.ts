@@ -12,8 +12,8 @@ export interface WorkspacePackage {
   /** Repository-relative directory, `/`-separated (`libraries/parcel`). */
   readonly directory: string
   readonly manifest: Readonly<Record<ManifestField, readonly string[]>>
-  /** Dependency names declared as `npm:` aliases (`"vite": "npm:@voidzero-dev/vite-plus-core@1"`). */
-  readonly aliases: ReadonlySet<string>
+  /** Dependencies declared as `npm:` aliases, by declared name, with the package each installs. */
+  readonly aliases: ReadonlyMap<string, string>
 }
 
 export interface Workspace {
@@ -23,7 +23,6 @@ export interface Workspace {
   readonly byName: ReadonlyMap<string, WorkspacePackage>
   /** The root package's own dependency fields. */
   readonly rootManifest: Readonly<Record<ManifestField, readonly string[]>>
-  readonly rootAliases: ReadonlySet<string>
   /** Members that cannot be checked: no name, a name another member has, an unreadable package.json. */
   readonly problems: readonly { readonly directory: string; readonly message: string }[]
 }
@@ -63,14 +62,17 @@ const fieldsOf = (manifest: Manifest): Record<ManifestField, readonly string[]> 
   peerDependencies: namesOf(manifest.peerDependencies),
 })
 
-const aliasesOf = (manifest: Manifest): Set<string> => {
-  const aliases = new Set<string>()
+/** `{ vite: "@voidzero-dev/vite-plus-core" }` for `"vite": "npm:@voidzero-dev/vite-plus-core@1"`. */
+const aliasesOf = (manifest: Manifest): Map<string, string> => {
+  const aliases = new Map<string, string>()
 
   for (const field of [manifest.dependencies, manifest.devDependencies, manifest.optionalDependencies, manifest.peerDependencies]) {
     if (typeof field === "object" && field !== null && !Array.isArray(field)) {
       for (const [name, spec] of Object.entries(field)) {
-        if (typeof spec === "string" && spec.startsWith("npm:")) {
-          aliases.add(name)
+        const target = typeof spec === "string" ? /^npm:(?<target>@?[^@]+)/u.exec(spec)?.groups?.target : undefined
+
+        if (target !== undefined) {
+          aliases.set(name, target)
         }
       }
     }
@@ -93,39 +95,50 @@ const workspaceGlobs = (manifest: Manifest): readonly string[] | undefined => {
   return undefined
 }
 
-const declaresWorkspaces = (manifest: string): boolean => {
+const workspacesOf = (manifest: string): readonly string[] => {
   try {
-    return (workspaceGlobs(readManifest(manifest))?.length ?? 0) > 0
+    return workspaceGlobs(readManifest(manifest)) ?? []
   } catch {
-    return false
+    return []
   }
 }
 
 /**
- * The nearest directory at or above `start` whose `package.json` declares a non-empty `workspaces`, without leaving the
- * repository `start` is in (a directory holding `.git`, a worktree's `.git` file included). Nearest, so a worktree
- * kept inside another checkout is its own workspace; non-empty, so a member with a stray `"workspaces": []` cannot
- * make itself the root of an empty workspace.
+ * The workspace root for a file in `start`: the nearest directory at or above it whose `package.json` declares
+ * workspaces that hold `start` (one of its globs matches `start` or a directory above it), else the nearest one with
+ * any workspaces at all. Nearest, so a worktree kept inside another checkout is its own workspace; holding, so a git
+ * submodule or a member with its own stray `workspaces` still belongs to the workspace that lists it.
  */
 export const findWorkspaceRoot = (start: string): string | undefined => {
-  let directory = nodePath.resolve(start)
+  const directory = nodePath.resolve(start)
+  let nearest: string | undefined
 
-  for (;;) {
-    if (declaresWorkspaces(nodePath.join(directory, "package.json"))) {
-      return directory
+  for (let candidate = directory; ; candidate = nodePath.dirname(candidate)) {
+    const globs = workspacesOf(nodePath.join(candidate, "package.json")).filter((glob) => !glob.startsWith("!"))
+
+    if (globs.length > 0) {
+      nearest ??= candidate
+      const parts = nodePath
+        .relative(candidate, directory)
+        .split(nodePath.sep)
+        .filter((part) => part !== "")
+      const holds = parts.some((_, index) => {
+        const prefix = parts.slice(0, index + 1).join("/")
+
+        return globs.some((glob) => matchesGlob(prefix, glob.replace(/^\.\//u, "").replace(/\/$/u, "")))
+      })
+
+      if (holds || parts.length === 0) {
+        return candidate
+      }
     }
 
-    const parent = nodePath.dirname(directory)
-
-    if (parent === directory || existsSync(nodePath.join(directory, ".git"))) {
-      return undefined
+    if (nodePath.dirname(candidate) === candidate) {
+      return nearest
     }
-
-    directory = parent
   }
 }
 
-/** Directories under `root` (relative, `/`-separated) that a workspace glob names, skipping `node_modules` and dot directories. */
 export const directoriesMatching = (root: string, pattern: string): string[] => {
   const negated = pattern.startsWith("!")
   const clean = (negated ? pattern.slice(1) : pattern).replace(/^\.\//u, "").replace(/\/$/u, "")
@@ -224,7 +237,7 @@ export const loadWorkspace = (root: string): Workspace => {
     byName.set(entry.name, entry)
   }
 
-  return { root, packages, byName, rootManifest: fieldsOf(rootManifest), rootAliases: aliasesOf(rootManifest), problems }
+  return { root, packages, byName, rootManifest: fieldsOf(rootManifest), problems }
 }
 
 /** The package whose directory holds the repository-relative `file`, the deepest one when packages nest. */

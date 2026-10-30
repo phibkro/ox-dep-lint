@@ -19,7 +19,7 @@ ox-dep-lint replaces the hand-written module graph checks of three repositories 
 | `package-path-escape`              | A package specifier with `.` or `..` after the name (`@acme/a/../b/src/x.ts`).                                                                                                                                                                                                                                                                                    | both                            |
 | `relative-import-leaves-package`   | A relative path, alias, root-absolute path or `new URL(..., import.meta.url)` that resolves into another package, into `node_modules` or out of the repository. Import a package by its name instead.                                                                                                                                                             | both                            |
 | `shipped-imports-development-file` | Shipped code importing a development file (of its own package, or one another package exports) that would not pass as shipped code itself: a test helper using `fast-check`, a script using `node:fs`. A development file that would pass, such as a shared helper under `scripts/`, may be imported.                                                             | both                            |
-| `forbidden-external`               | An outside package that the kind's `externals` does not allow, in shipped code or in `package.json`'s shipped fields. An outside package is named by where it resolves, so an alias cannot pass one package off as another.                                                                                                                                       | both, `package.json` in the CLI |
+| `forbidden-external`               | An outside package that the kind's `externals` does not allow, in shipped code or in `package.json`'s shipped fields. An outside package is named by the package it installs (the `name` in its installed `package.json`, or an `npm:` alias's target), so an alias cannot pass one package off as another; `externals` name real packages.                       | both, `package.json` in the CLI |
 | `runtime-module`                   | `node:*`, a bare Node built-in (`fs`), `bun`, `bun:*` or `cloudflare:*`, also when a package import (`#crypto`) maps to one, in the shipped code of a kind with `runtimeModules: false`.                                                                                                                                                                          | both                            |
 | `test-only-in-shipped`             | A `testOnlySpecifiers` match (`fast-check`, `vite-plus/test`) in shipped code, with any `?query` stripped.                                                                                                                                                                                                                                                        | both                            |
 | `undeclared-import`                | A package the file's own `package.json` does not declare. Shipped code needs `dependencies`, `peerDependencies` or `optionalDependencies` (`imports.shippedFields`); type-only imports and development files may also use devDependencies and the root's. This covers what knip misses: files no entry reaches, and shipped code leaning on a root devDependency. | both                            |
@@ -33,7 +33,7 @@ ox-dep-lint replaces the hand-written module graph checks of three repositories 
 | `stale-baseline`                   | A baseline entry that no finding needs any more, so the baseline can only shrink.                                                                                                                                                                                                                                                                                 | CLI                             |
 | `parse-error`                      | A file that does not parse, so its imports cannot be checked.                                                                                                                                                                                                                                                                                                     | both                            |
 
-A load is any of: `import` and `export ... from` (static, `defer` and `source` phases), `import()`, a type-level `import("...")`, `import x = require("...")`, a string-named `declare module "..."`, `/// <reference types="..." />`, `require`, `require.resolve`, `module.require`, `import.meta.require`, `import.meta.resolve`, `process.getBuiltinModule`, `createRequire(...)("...")`, and `new URL("...", import.meta.url)` of a source file (how bundlers load workers; a URL of a JSON file, an asset, a directory or another origin locates something to read and is not a load). `require.resolve` and `import.meta.resolve` with a literal are edges; with an expression they load nothing.
+A load is any of: `import` and `export ... from` (static, `defer` and `source` phases), `import()`, a type-level `import("...")`, `import x = require("...")`, a string-named `declare module "..."`, `/// <reference types="..." />`, `require`, `require.resolve`, `module.require`, `import.meta.require`, `import.meta.resolve`, `process.getBuiltinModule`, `createRequire(...)("...")`, and a `new URL("...", import.meta.url)` passed to `new Worker`, `new SharedWorker` or `navigator.serviceWorker.register` (bundlers load it as a module, extension or not; any other `new URL` locates a file to read or an asset to serve, and is not a load). `require.resolve` and `import.meta.resolve` with a literal are edges; with an expression they load nothing.
 
 ## Files: shipped, development, unchecked
 
@@ -43,7 +43,7 @@ The first matching file class decides how a file is checked. Globs in a class ar
 - **development:** kind edges, relative imports and unresolved imports are still checked. The file may use devDependencies (its own and the root's), test-only specifiers, runtime modules, any outside package and computed `import()`.
 - **unchecked:** the file is not read.
 
-By default, `test/**`, `tests/**`, `e2e/**`, `scripts/**`, `**/__tests__/**`, `**/fixtures/**` and `**/*.{test,spec,bench}.*` are development files. Every package's `dist/**`, `build/**`, `public/**` and `coverage/**` are never read. A package's `testSupportFiles` are development files too (a conformance suite's entry, for example).
+By default, `test/**`, `tests/**`, `e2e/**`, `scripts/**`, package-root `*.config.*`, `**/__tests__/**`, `**/fixtures/**` and `**/*.{test,spec,bench}.*` are development files. A package's `dist/**` and `coverage/**` are not read; `output` changes that list (`[]` reads everything). A package's `testSupportFiles` are development files too (a conformance suite's entry, for example).
 
 ## Configuration
 
@@ -92,14 +92,14 @@ Releases are published from a `v*` tag by `.github/workflows/release.yml`, with 
 
 ## Running it
 
-The CLI walks every workspace package's directory (skipping `node_modules`, dot directories and the build output above), so generated and gitignored sources and nested repositories are checked too, and runs the whole-graph checks:
+The CLI walks every workspace package's directory (skipping `node_modules`, dot directories and `output`), so generated and gitignored sources and nested repositories are checked too, and runs the whole-graph checks:
 
 ```sh
 ox-dep-lint            # finds ox-dep-lint.config.{ts,mts,js,mjs,json} at the workspace root
 ox-dep-lint --config path/to/config.ts --root path/to/workspace
 ```
 
-The workspace root is the nearest directory with a `package.json` that declares a non-empty `workspaces`, without leaving the repository (a directory holding `.git`), so a worktree kept inside another checkout is checked as itself.
+The workspace root for a file is the nearest directory whose `package.json` `workspaces` hold that file, else the nearest with any `workspaces`. A worktree kept inside another checkout is checked as itself, and a git submodule listed as a member still belongs to the workspace that lists it.
 
 The oxlint plugin reports the per-file findings in the editor and in `oxlint` / `vp lint`. It takes the same configuration as the option of its one rule:
 
@@ -124,7 +124,6 @@ Where they can still differ: oxlint chooses which files it lints (its own ignore
 - `import.meta.glob` patterns are reported as computed rather than read. vektorprogrammet-reimagined's closed glob grammar is the next thing to lift.
 - Modules and layers inside a package, and restricted specifier groups with per-file allowances, are not in this version yet. vektorprogrammet-reimagined needs both.
 - pnpm's `pnpm-workspace.yaml` is not read; the root `package.json` `workspaces` is.
-- An `npm:` alias in a dependency is judged by the alias name (its install directory), not the package it installs.
 - `/// <reference path="..." />` and JSDoc `@import` types are not read.
 
 ## Licence

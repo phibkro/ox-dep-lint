@@ -198,7 +198,6 @@ describe("the second review's findings", () => {
       const inner = nodePath.join(outer, ".claude/worktrees/wt")
       mkdirSync(nodePath.join(inner), { recursive: true })
       writeFileSync(nodePath.join(inner, ".git"), "gitdir: elsewhere\n")
-      expect(findWorkspaceRoot(nodePath.join(inner, "libraries/parcel/src"))).toBeUndefined()
       writeFileSync(nodePath.join(inner, "package.json"), JSON.stringify({ name: "wt", workspaces: ["libraries/*"] }))
       expect(findWorkspaceRoot(nodePath.join(inner, "libraries/parcel/src"))).toBe(inner)
       expect(findWorkspaceRoot(nodePath.join(outer, "libraries/parcel/src"))).toBe(outer)
@@ -298,27 +297,176 @@ describe("development files behind a package's exports (M6) and npm aliases (M8)
     }
   })
 
-  it("judges an npm alias by the name it is declared under, as bun's isolated store installs it", () => {
-    const config: Config = { ...validConfig, kinds: { ...validConfig.kinds, app: { packages: ["apps/*"], mayUse: ["library"], externals: ["vite"] } } }
-    const root = writeWorkspace({
+  it("judges an npm alias by the package it installs, so an alias cannot pass one package off as another", () => {
+    const store = "node_modules/.bun/@voidzero-dev+vite-plus-core@1/node_modules/@voidzero-dev/vite-plus-core"
+    const files = {
       ...validWorkspace,
       "apps/web/package.json": { name: "@acme/web", dependencies: { "@acme/parcel": "workspace:*", vite: "npm:@voidzero-dev/vite-plus-core@1" } },
       "apps/web/src/build.ts": 'import { build } from "vite"\nexport const b = build\n',
-      "node_modules/.bun/@voidzero-dev+vite-plus-core@1/node_modules/@voidzero-dev/vite-plus-core/package.json": {
-        name: "@voidzero-dev/vite-plus-core",
-        main: "index.js",
-      },
-      "node_modules/.bun/@voidzero-dev+vite-plus-core@1/node_modules/@voidzero-dev/vite-plus-core/index.js": "export const build = 1\n",
+      [`${store}/package.json`]: { name: "@voidzero-dev/vite-plus-core", main: "index.js" },
+      [`${store}/index.js`]: "export const build = 1\n",
+    }
+    const withExternals = (externals: string[]): Config => ({
+      ...validConfig,
+      kinds: { ...validConfig.kinds, app: { packages: ["apps/*"], mayUse: ["library"], externals } },
+    })
+    const root = writeWorkspace(files)
+
+    try {
+      symlinkSync(nodePath.join(root, store), nodePath.join(root, "node_modules/vite"))
+      const rules = (config: Config) => checkWorkspace(root, config).findings.map((finding) => `${finding.rule} ${finding.target ?? ""}`)
+      // Once at the import, once where package.json declares it.
+      expect(rules(withExternals(["vite"]))).toEqual(["forbidden-external @voidzero-dev/vite-plus-core", "forbidden-external @voidzero-dev/vite-plus-core"])
+      expect(rules(withExternals(["@voidzero-dev/vite-plus-core"]))).toEqual([])
+    } finally {
+      removeWorkspace(root)
+    }
+  })
+
+  it("judges an alias of a test-only package as that package", () => {
+    const root = writeWorkspace({
+      ...validWorkspace,
+      "apps/web/package.json": { name: "@acme/web", dependencies: { "@acme/parcel": "workspace:*", "fc-kit": "npm:fast-check@4" } },
+      "apps/web/src/fuzz.ts": 'import fc from "fc-kit"\nexport const f = fc\n',
+      "node_modules/fc-kit/package.json": { name: "fast-check", main: "index.js" },
+      "node_modules/fc-kit/index.js": "export default 1\n",
     })
 
     try {
-      symlinkSync(
-        nodePath.join(root, "node_modules/.bun/@voidzero-dev+vite-plus-core@1/node_modules/@voidzero-dev/vite-plus-core"),
-        nodePath.join(root, "node_modules/vite"),
-      )
-      expect(checkWorkspace(root, config).findings).toEqual([])
+      expect(checkWorkspace(root, validConfig).findings.map((finding) => `${finding.rule} ${finding.target ?? ""}`)).toEqual(["test-only-in-shipped fc-kit"])
     } finally {
       removeWorkspace(root)
+    }
+  })
+})
+
+describe("the third review's findings", () => {
+  it("reads build output when output says so (H-A)", () => {
+    const files = { [library]: 'export * from "../dist/helper.ts"\n', "libraries/parcel/dist/helper.ts": 'export { readFileSync } from "node:fs"\n' }
+    expect(findingsWith(files)).toEqual([])
+    expect(findingsWith(files, { ...validConfig, output: [] })).toEqual(["runtime-module node:fs"])
+  })
+
+  it("does not take a name that merely starts with a package's name for its subpath (H-B)", () => {
+    const root = writeWorkspace({
+      ...validWorkspace,
+      "tsconfig.json": { compilerOptions: { paths: { "fast-check-kit": ["./node_modules/fast-check/index.js"] } } },
+      "apps/web/package.json": { name: "@acme/web", dependencies: { "@acme/parcel": "workspace:*", "fast-check": "1" } },
+      "apps/web/src/fuzz.ts": 'import fc from "fast-check-kit"\nexport const f = fc\n',
+      "node_modules/fast-check/package.json": { name: "fast-check", main: "index.js" },
+      "node_modules/fast-check/index.js": "export default 1\n",
+    })
+
+    try {
+      expect(checkWorkspace(root, validConfig).findings.map((finding) => `${finding.rule} ${finding.target ?? ""}`)).toContain(
+        "test-only-in-shipped fast-check-kit",
+      )
+    } finally {
+      removeWorkspace(root)
+    }
+  })
+
+  it("roots a submodule member at the workspace that lists it (M-1)", () => {
+    const root = writeWorkspace({
+      ...validWorkspace,
+      "libraries/parcel/.git": "gitdir: elsewhere\n",
+      "libraries/parcel/package.json": { name: "@acme/parcel", workspaces: ["vendor/*"] },
+    })
+
+    try {
+      expect(findWorkspaceRoot(nodePath.join(root, "libraries/parcel/src"))).toBe(root)
+    } finally {
+      removeWorkspace(root)
+    }
+  })
+
+  it("follows a package's own exported development file and cycles between development files (M-3)", () => {
+    const cycle = {
+      [library]: 'export * from "../scripts/b.ts"\n',
+      "libraries/parcel/scripts/a.ts": 'import fc from "fast-check"\nexport * from "./b.ts"\nexport const a = fc\n',
+      "libraries/parcel/scripts/b.ts": 'export * from "./a.ts"\nexport const b = 1\n',
+    }
+    expect(findingsWith(cycle)).toEqual(["shipped-imports-development-file ../scripts/b.ts"])
+  })
+
+  it("long chains of development files end without exhausting the stack (L-b)", () => {
+    const chain: Record<string, string> = { [library]: 'export * from "../scripts/link0.ts"\n' }
+
+    for (let index = 0; index < 3000; index++) {
+      chain[`libraries/parcel/scripts/link${index}.ts`] =
+        index === 2999 ? 'export { readFileSync } from "node:fs"\n' : `export * from "./link${index + 1}.ts"\n`
+    }
+
+    expect(findingsWith(chain)).toEqual(["shipped-imports-development-file ../scripts/link0.ts"])
+  }, 60_000)
+
+  it("catches require passed in a shorthand property and called through window (M-4)", () => {
+    expect(
+      findingsWith({ [library]: 'const box = { require }\nexport const fs = box.require("node:fs")\nexport const os = window.require("node:os")\n' }),
+    ).toEqual(["computed-import require", "runtime-module node:os"])
+  })
+
+  it("lets require name members, types and declarations (M-5)", () => {
+    const source = [
+      "class Loader { require(name: string) { return name } }",
+      "interface Needs { require: string; check(): void }",
+      "declare function require(name: string): unknown",
+      "type Require = typeof require",
+      "export const loader = new Loader()",
+    ].join("\n")
+    expect(findingsWith({ "platforms/cloudflare/src/members.ts": source })).toEqual([])
+  })
+
+  it("reads a worker URL without an extension and ignores other URLs (M-6)", () => {
+    const source = [
+      'export const worker = new Worker(new URL("../../../services/room/src/index", import.meta.url))',
+      "export const icon = (name: string) => new URL(`./assets/${name}.png`, import.meta.url)",
+      'export const text = new URL("../../../services/room/src/index.ts", import.meta.url)',
+      'export const own = new Worker(new URL("lazy.ts", import.meta.url))',
+    ].join("\n")
+    expect(findingsWith({ "apps/web/src/urls.ts": source })).toEqual(["relative-import-leaves-package ../../../services/room/src/index"])
+  })
+
+  it("treats package-root config files as development files by default (M-7)", () => {
+    expect(findingsWith({ "apps/web/vite.config.ts": 'import fc from "fast-check"\nexport default fc\n' })).toEqual([])
+  })
+
+  it("judges a workspace name a paths alias sends into node_modules as the package it lands in (M-8)", () => {
+    const root = writeWorkspace({
+      ...validWorkspace,
+      "services/room/tsconfig.json": { compilerOptions: { paths: { "@acme/parcel": ["../../node_modules/fast-check/index.js"] } } },
+      "node_modules/fast-check/package.json": { name: "fast-check", main: "index.js" },
+      "node_modules/fast-check/index.js": "export default 1\n",
+    })
+
+    try {
+      expect(checkWorkspace(root, validConfig).findings.map((finding) => `${finding.rule} ${finding.target ?? ""}`)).toContain(
+        "test-only-in-shipped @acme/parcel",
+      )
+    } finally {
+      removeWorkspace(root)
+    }
+  })
+
+  it("refuses more wrongly typed values and unknown baseline rules (L-c)", () => {
+    const wrong = {
+      ...validConfig,
+      imports: { shippedFields: "dependencies", manifestEdgeFields: ["deps"] },
+      runtimeModules: { prefixes: "node:" },
+      kinds: { ...validConfig.kinds, library: { packages: ["libraries/*"], mayUse: ["library"], runtimeModules: "no" } },
+      baseline: [{ file: library, rule: "no-such-rule", target: "x", reason: "later" }],
+    }
+    // SAFETY: deliberately not a Config, to see what validation says about it.
+    const problems = configProblems(wrong as unknown as Config).join("\n")
+
+    for (const expected of [
+      "imports.shippedFields",
+      "imports.manifestEdgeFields",
+      "runtimeModules.prefixes",
+      "runtimeModules must be true or false",
+      "unknown rule no-such-rule",
+    ]) {
+      expect(problems).toContain(expected)
     }
   })
 })

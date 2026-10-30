@@ -6,7 +6,7 @@
  * An outside package is named by where it resolves (the last `node_modules` segment of its path), not by how it is
  * written, so an alias (`paths`, `#imports`, `npm:`) cannot pass one package off as another.
  */
-import { existsSync, realpathSync } from "node:fs"
+import { existsSync, readFileSync, realpathSync } from "node:fs"
 import nodePath from "node:path"
 import { ResolverFactory } from "oxc-resolver"
 import type { ResolvedConfig } from "./config.ts"
@@ -58,6 +58,39 @@ const installedName = (path: string): string | undefined => {
   const first = parts[index + 1]
 
   return first?.startsWith("@") === true ? `${first}/${parts[index + 2] ?? ""}` : first
+}
+
+const packageNames = new Map<string, string | undefined>()
+
+/**
+ * The real name of the installed package a path belongs to: the `name` in the package.json at its root (after its last
+ * `node_modules` segment), so an `npm:` alias (`"valibot": "npm:fast-check"`) is judged as the package it installs.
+ */
+const installedPackageName = (path: string): string | undefined => {
+  const parts = path.split(nodePath.sep)
+  const index = parts.lastIndexOf("node_modules")
+  const directoryName = installedName(path)
+
+  if (index === -1 || directoryName === undefined) {
+    return undefined
+  }
+
+  const directory = [...parts.slice(0, index + 1), ...directoryName.split("/")].join(nodePath.sep)
+
+  if (!packageNames.has(directory)) {
+    let name: string | undefined
+
+    try {
+      const manifest: unknown = JSON.parse(readFileSync(nodePath.join(directory, "package.json"), "utf8"))
+      name = typeof manifest === "object" && manifest !== null && "name" in manifest && typeof manifest.name === "string" ? manifest.name : undefined
+    } catch {
+      name = undefined
+    }
+
+    packageNames.set(directory, name ?? directoryName)
+  }
+
+  return packageNames.get(directory)
 }
 
 /** Strips a query (`?raw`) and a fragment, never a leading `#` (a package import). */
@@ -132,6 +165,11 @@ export const makeResolver = (workspace: Workspace, config: ResolvedConfig): Reso
         const file = found === undefined ? undefined : inside(found)
         const owner = file === undefined ? undefined : packageOfFile(workspace, file)
 
+        if (found !== undefined && file === undefined && found.split(nodePath.sep).includes("node_modules")) {
+          // A paths alias that spells a workspace name but lands in an installed package is that package.
+          return { kind: "external", name: installedPackageName(found) ?? name, written: name }
+        }
+
         return file === undefined ? { kind: "workspace", name } : { kind: "workspace", name: owner?.name ?? name, file }
       }
 
@@ -167,11 +205,7 @@ export const makeResolver = (workspace: Workspace, config: ResolvedConfig): Reso
       return aliasPrefixes.some((prefix) => specifier.startsWith(prefix)) ? { kind: "unresolved" } : { kind: "external", name, written: name }
     }
 
-    // An `npm:` alias keeps the name it is declared under, which is what a configuration names.
-    const importerPackage = packageOfFile(workspace, importer)
-    const aliased = importerPackage?.aliases.has(name) === true || workspace.rootAliases.has(name)
-
-    return { kind: "external", name: aliased ? name : (installedName(result.path) ?? name), written: name }
+    return { kind: "external", name: installedPackageName(result.path) ?? name, written: name }
   }
 
   return { resolve, clear: () => factory.clearCache() }

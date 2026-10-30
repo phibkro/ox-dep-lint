@@ -54,16 +54,22 @@ interface LiteralLike extends Spanned {
 }
 
 /** Calls that load the module their first argument names. */
-const loaders = new Set(["require", "module.require", "import.meta.require", "process.getBuiltinModule", "globalThis.require", "global.require"])
+const loaders = new Set([
+  "require",
+  "module.require",
+  "import.meta.require",
+  "process.getBuiltinModule",
+  "globalThis.require",
+  "global.require",
+  "window.require",
+  "self.require",
+])
 
 /** Calls that only locate a module: a literal argument is still an edge, a computed one loads nothing. */
 const locators = new Set(["require.resolve", "import.meta.resolve"])
 
-/** A file a bundler or runtime loads as a module from a URL (`new Worker(new URL("./x.ts", import.meta.url))`). */
-const moduleFile = /\.(?:[cm]?[jt]sx?)$/u
-
 /** `(require)`, `(0, require)` and `( require )` are `require`. */
-const plainCallee = (callee: string) => callee.replace(/^\((?:0,)?(.*)\)$/su, "$1")
+const plainCallee = (callee: string) => callee.replace(/^\((?:0,)?(.*)\)$/su, "$1").replaceAll("?.", ".")
 
 /** Line (1-based) and column (0-based) of each offset, from the line starts of `text`. */
 const locator = (text: string) => {
@@ -143,11 +149,46 @@ export const importForms = (path: string, source: string): ImportForms => {
   const requireCallees: Spanned[] = []
   const harmlessRequires = new Set<number>()
 
+  const harmlessKey = (node: { readonly computed: boolean; readonly key: object }) => {
+    const key: { type?: unknown; name?: unknown; start?: unknown } = node.key
+
+    if (!node.computed && key.type === "Identifier" && key.name === "require" && typeof key.start === "number") {
+      harmlessRequires.add(key.start)
+    }
+  }
+
   const bindParameters = (parameters: readonly { readonly type: string; readonly start: number; readonly name?: string }[]) => {
     for (const parameter of parameters) {
       if (parameter.type === "Identifier" && parameter.name === "require") {
         harmlessRequires.add(parameter.start)
       }
+    }
+  }
+
+  /**
+   * `new Worker(new URL("./x.ts", import.meta.url))` loads x.ts as a module, extension or not (bundlers resolve it). A
+   * `new URL(..., import.meta.url)` anywhere else locates a file to read or an asset to serve, and loads nothing.
+   */
+  const readWorkerUrl = (argument: LiteralLike | undefined) => {
+    const url = argument as (LiteralLike & { readonly callee?: Spanned; readonly arguments?: readonly LiteralLike[] }) | undefined
+
+    if (url?.type !== "NewExpression" || url.callee === undefined || compact(text.slice(url.callee.start, url.callee.end)) !== "URL") {
+      return
+    }
+
+    const [first, second] = url.arguments ?? []
+
+    if (first === undefined || second === undefined || compact(text.slice(second.start, second.end)) !== "import.meta.url") {
+      return
+    }
+
+    const value = spelled(first)
+
+    if (value === undefined || /^(?:\.{1,2}\/|\/|[a-z][a-z0-9+.-]*:)/iu.test(value)) {
+      add(first, false)
+    } else {
+      // A URL is relative to the file even without `./`; as an import specifier that would name a package.
+      imports.push({ ...at(first.start), start: first.start, end: first.end, specifier: `./${value}`, typeOnly: false })
     }
   }
 
@@ -174,7 +215,9 @@ export const importForms = (path: string, source: string): ImportForms => {
       const callee = plainCallee(compact(text.slice(node.callee.start, node.callee.end)))
       const [first] = node.arguments
 
-      if (locators.has(callee)) {
+      if (callee === "navigator.serviceWorker.register") {
+        readWorkerUrl(first?.type === "SpreadElement" ? undefined : first)
+      } else if (locators.has(callee)) {
         requireCallees.push(node.callee)
 
         if (first !== undefined && first.type !== "SpreadElement" && spelled(first) !== undefined) {
@@ -196,25 +239,10 @@ export const importForms = (path: string, source: string): ImportForms => {
       }
     },
     NewExpression(node) {
-      const [first, second] = node.arguments
+      const callee = compact(text.slice(node.callee.start, node.callee.end))
 
-      if (
-        compact(text.slice(node.callee.start, node.callee.end)) === "URL" &&
-        second !== undefined &&
-        compact(text.slice(second.start, second.end)) === "import.meta.url"
-      ) {
-        // Only a URL of a source file is a module a bundler loads (a worker); a URL of a directory, a JSON file or an
-        // asset locates something on disk to read. A query or a fragment does not change which file it names.
-        const value = first === undefined || first.type === "SpreadElement" ? undefined : spelled(first)
-        const file = value?.replace(/[?#].*$/u, "")
-
-        if (
-          first !== undefined &&
-          first.type !== "SpreadElement" &&
-          (value === undefined || (file !== undefined && moduleFile.test(file) && !/^[a-z][a-z0-9+.-]*:/iu.test(file)))
-        ) {
-          add(first, false)
-        }
+      if (callee === "Worker" || callee === "SharedWorker") {
+        readWorkerUrl(node.arguments[0])
       }
     },
     Identifier(node) {
@@ -233,8 +261,38 @@ export const importForms = (path: string, source: string): ImportForms => {
       }
     },
     Property(node) {
-      if (!node.computed && node.key.type === "Identifier" && node.key.name === "require") {
+      // `{ require: 1 }` names a key; the shorthand `{ require }` also passes the loader along, which is a use.
+      if (!node.computed && !node.shorthand && node.key.type === "Identifier" && node.key.name === "require") {
         harmlessRequires.add(node.key.start)
+      }
+    },
+    MethodDefinition(node) {
+      harmlessKey(node)
+    },
+    PropertyDefinition(node) {
+      harmlessKey(node)
+    },
+    TSPropertySignature(node) {
+      harmlessKey(node)
+    },
+    TSMethodSignature(node) {
+      harmlessKey(node)
+    },
+    TSDeclareFunction(node) {
+      if (node.id?.name === "require") {
+        harmlessRequires.add(node.id.start)
+      }
+    },
+    TSTypeQuery(node) {
+      if (node.exprName.type === "Identifier" && node.exprName.name === "require") {
+        harmlessRequires.add(node.exprName.start)
+      }
+    },
+    ImportSpecifier(node) {
+      for (const name of [node.imported, node.local]) {
+        if (name.type === "Identifier" && name.name === "require") {
+          harmlessRequires.add(name.start)
+        }
       }
     },
     VariableDeclarator(node) {
@@ -245,6 +303,10 @@ export const importForms = (path: string, source: string): ImportForms => {
     },
     FunctionDeclaration(node) {
       bindParameters(node.params)
+
+      if (node.id?.name === "require") {
+        harmlessRequires.add(node.id.start)
+      }
     },
     FunctionExpression(node) {
       bindParameters(node.params)
@@ -274,7 +336,8 @@ export const importForms = (path: string, source: string): ImportForms => {
   }).visit(program)
 
   // `const load = require`, `[require].map(...)`: a require passed around loads modules the check cannot follow.
-  for (const identifier of requireIdentifiers) {
+  // A shorthand property (`{ require }`) visits one identifier as both key and value.
+  for (const identifier of new Map(requireIdentifiers.map((node) => [node.start, node])).values()) {
     const called = requireCallees.some((callee) => callee.start <= identifier.start && identifier.end <= callee.end)
 
     if (!called && !harmlessRequires.has(identifier.start)) {

@@ -39,26 +39,29 @@ export interface FileClass {
   readonly policy: FilePolicy
 }
 
-export type RuleName =
-  | "unknown-workspace-package"
-  | "package-without-kind"
-  | "package-outside-workspace"
-  | "invalid-package"
-  | "forbidden-edge"
-  | "type-only-edge"
-  | "relative-import-leaves-package"
-  | "package-path-escape"
-  | "shipped-imports-development-file"
-  | "self-import-by-name"
-  | "forbidden-external"
-  | "runtime-module"
-  | "test-only-in-shipped"
-  | "undeclared-import"
-  | "computed-import"
-  | "unresolved-import"
-  | "package-cycle"
-  | "stale-baseline"
-  | "parse-error"
+export const ruleNames = [
+  "unknown-workspace-package",
+  "package-without-kind",
+  "package-outside-workspace",
+  "invalid-package",
+  "forbidden-edge",
+  "type-only-edge",
+  "relative-import-leaves-package",
+  "package-path-escape",
+  "shipped-imports-development-file",
+  "self-import-by-name",
+  "forbidden-external",
+  "runtime-module",
+  "test-only-in-shipped",
+  "undeclared-import",
+  "computed-import",
+  "unresolved-import",
+  "package-cycle",
+  "stale-baseline",
+  "parse-error",
+] as const
+
+export type RuleName = (typeof ruleNames)[number]
 
 /** A finding the repository tolerates for now. The check fails when no finding needs it any more, so the list shrinks. */
 export interface BaselineEntry {
@@ -107,8 +110,10 @@ export interface Config {
   readonly testOnlySpecifiers?: readonly string[]
   readonly imports?: ImportPolicy
   readonly baseline?: readonly BaselineEntry[]
-  /** Repository-relative globs of files never read. Every package's `dist/**` and `coverage/**` are never read either. */
+  /** Repository-relative globs of files never read. */
   readonly ignore?: readonly string[]
+  /** Package-relative globs of build output, never read. Default `dist/**` and `coverage/**`; `[]` reads everything. */
+  readonly output?: readonly string[]
 }
 
 /** The configuration with every default filled in. */
@@ -124,17 +129,18 @@ export interface ResolvedConfig {
   readonly imports: Required<ImportPolicy>
   readonly baseline: readonly BaselineEntry[]
   readonly ignore: readonly string[]
+  readonly output: readonly string[]
 }
 
 export const defaultFileClasses: readonly FileClass[] = [
   {
-    files: ["test/**", "tests/**", "e2e/**", "scripts/**", "**/__tests__/**", "**/fixtures/**", "**/*.test.*", "**/*.spec.*", "**/*.bench.*"],
+    files: ["test/**", "tests/**", "e2e/**", "scripts/**", "*.config.*", "**/__tests__/**", "**/fixtures/**", "**/*.test.*", "**/*.spec.*", "**/*.bench.*"],
     policy: "development",
   },
 ]
 
-/** Build output, static files and coverage reports under a package, never read. */
-export const packageOutput: readonly string[] = ["dist/**", "build/**", "public/**", "coverage/**"]
+/** Build output and coverage reports under a package, never read unless `output` says otherwise. */
+export const defaultOutput: readonly string[] = ["dist/**", "coverage/**"]
 
 const allManifestFields: readonly ManifestField[] = ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"]
 
@@ -142,7 +148,19 @@ const allManifestFields: readonly ManifestField[] = ["dependencies", "devDepende
 export const defineConfig = (config: Config): Config => config
 
 const allowedKeys = {
-  config: ["workspaceScopes", "kinds", "packages", "fileClasses", "runtimeModules", "virtualModules", "testOnlySpecifiers", "imports", "baseline", "ignore"],
+  config: [
+    "workspaceScopes",
+    "kinds",
+    "packages",
+    "fileClasses",
+    "runtimeModules",
+    "virtualModules",
+    "testOnlySpecifiers",
+    "imports",
+    "baseline",
+    "ignore",
+    "output",
+  ],
   kind: ["packages", "mayUse", "externals", "runtimeModules"],
   package: ["uses", "externals", "typeOnlyUses", "valueSpecifiers", "testSupportFiles"],
   fileClass: ["files", "policy"],
@@ -190,6 +208,10 @@ export const configProblems = (config: Config): string[] => {
       problems.push(`kind ${name}: mayUse must be "any" or a list of kinds`)
     }
 
+    if (kind.runtimeModules !== undefined && typeof kind.runtimeModules !== "boolean") {
+      problems.push(`kind ${name}: runtimeModules must be true or false`)
+    }
+
     if (kind.externals !== undefined && kind.externals !== "any" && !isStringList(kind.externals)) {
       problems.push(`kind ${name}: externals must be "any" or a list of package names`)
     }
@@ -213,7 +235,11 @@ export const configProblems = (config: Config): string[] => {
     }
   }
 
-  for (const key of ["workspaceScopes", "testOnlySpecifiers", "virtualModules", "ignore"] as const) {
+  if (!isStringList(config.workspaceScopes)) {
+    problems.push("workspaceScopes must be a list of scopes")
+  }
+
+  for (const key of ["testOnlySpecifiers", "virtualModules", "ignore", "output"] as const) {
     const value: unknown = config[key]
 
     if (value !== undefined && !isStringList(value)) {
@@ -221,8 +247,26 @@ export const configProblems = (config: Config): string[] => {
     }
   }
 
+  for (const [key, value] of Object.entries(config.runtimeModules ?? {})) {
+    if (!isStringList(value)) {
+      problems.push(`runtimeModules.${key} must be a list of strings`)
+    }
+  }
+
+  for (const key of ["manifestEdgeFields", "shippedFields"] as const) {
+    const value: unknown = config.imports?.[key]
+
+    if (value !== undefined && (!isStringList(value) || !(value as string[]).every((field) => allManifestFields.includes(field as ManifestField)))) {
+      problems.push(`imports.${key} must be a list of ${allManifestFields.join(", ")}`)
+    }
+  }
+
   for (const [index, fileClass] of (config.fileClasses ?? []).entries()) {
     problems.push(...unknownKeys(`file class ${index}`, fileClass, allowedKeys.fileClass))
+
+    if (!isStringList(fileClass.files)) {
+      problems.push(`file class ${index}: files must be a list of globs`)
+    }
 
     if (!["shipped", "development", "unchecked"].includes(fileClass.policy)) {
       problems.push(`file class ${index} has the unknown policy ${String(fileClass.policy)}`)
@@ -247,6 +291,10 @@ export const configProblems = (config: Config): string[] => {
 
   for (const entry of config.baseline ?? []) {
     problems.push(...unknownKeys(`the baseline entry for ${entry.file}`, entry, allowedKeys.baseline))
+
+    if (!(ruleNames as readonly string[]).includes(entry.rule)) {
+      problems.push(`the baseline entry for ${entry.file} names the unknown rule ${String(entry.rule)}`)
+    }
 
     if (typeof entry.target !== "string" || entry.target === "") {
       problems.push(`the baseline entry for ${entry.rule} in ${entry.file} names no target, so it would hide every future finding of that rule there`)
@@ -292,5 +340,6 @@ export const resolveConfig = (config: Config): ResolvedConfig => {
     },
     baseline: config.baseline ?? [],
     ignore: config.ignore ?? [],
+    output: config.output ?? defaultOutput,
   }
 }

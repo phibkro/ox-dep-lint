@@ -61,9 +61,17 @@ export const graphFindings = (engine: Engine): Finding[] => {
     for (const field of config.imports.shippedFields) {
       for (const name of entry.manifest[field]) {
         const outside = !workspace.byName.has(name) && !config.workspaceScopes.some((scope) => name.startsWith(scope))
+        // An npm: alias is judged by the package it installs.
+        const installed = entry.aliases.get(name) ?? name
 
-        if (outside && kindRule !== undefined && kindRule.externals !== "any" && !kindRule.externals.includes(name) && !extra.includes(name)) {
-          findings.push({ rule: "forbidden-external", file: manifest, ...at, message: `${field} names ${name}, which its kind does not allow`, target: name })
+        if (outside && kindRule !== undefined && kindRule.externals !== "any" && !kindRule.externals.includes(installed) && !extra.includes(installed)) {
+          findings.push({
+            rule: "forbidden-external",
+            file: manifest,
+            ...at,
+            message: `${field} names ${installed === name ? name : `${name} (${installed})`}, which its kind does not allow`,
+            target: installed,
+          })
         }
       }
     }
