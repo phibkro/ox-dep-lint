@@ -258,7 +258,8 @@ export const findingsForFile = (engine: Engine, file: string, text: string, opti
   }
 
   for (const site of forms.imports) {
-    const { typeOnly } = site
+    // Whether the rules that care about loading skip this import; kind edges below see the real form.
+    const typeOnly = site.typeOnly && config.imports.typeOnly === "relaxed"
     const specifier = withoutQuery(site.specifier)
     const target = engine.resolver.resolve(file, site.specifier)
 
@@ -341,7 +342,7 @@ export const findingsForFile = (engine: Engine, file: string, text: string, opti
           break
         }
 
-        const refusal = edgeRefusal(engine, owner, to, typeOnly, specifier)
+        const refusal = edgeRefusal(engine, owner, to, site.typeOnly, specifier)
 
         if (refusal !== undefined) {
           report(refusal.rule, site, refusal.why, to.name)
@@ -400,7 +401,7 @@ export const findingsForFile = (engine: Engine, file: string, text: string, opti
         const declared =
           declares(engine, owner, target.name, anywhere) ||
           declares(engine, owner, target.written, anywhere) ||
-          (typeOnly && declares(engine, owner, typesPackage(target.name), true))
+          (site.typeOnly && declares(engine, owner, typesPackage(target.name), anywhere))
 
         if (config.imports.requireDeclared && !declared) {
           report(

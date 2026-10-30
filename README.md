@@ -79,6 +79,9 @@ A kind may use its own kind only when `mayUse` lists it. `imports` holds the pol
 | `manifestEdgeFields` | all four fields                                            | any subset       |
 | `requireDeclared`    | `true`                                                     | `false`          |
 | `shippedFields`      | `dependencies`, `peerDependencies`, `optionalDependencies` | any subset       |
+| `typeOnly`           | `relaxed`                                                  | `as-values`      |
+
+`typeOnly: "as-values"` judges shipped code's type-only imports like value imports for `runtime-module`, `forbidden-external`, `undeclared-import` and `shipped-imports-development-file`, so `import type { Socket } from "bun"` fails in a kind without runtime modules. By default types do not load, so those rules skip them. Kind edges and `typeOnlyUses` always see the real form.
 
 Misspelled keys, unknown policies and baseline entries without a `target` are configuration errors, never silent defaults.
 
