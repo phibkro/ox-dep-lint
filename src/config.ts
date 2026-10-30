@@ -128,13 +128,13 @@ export interface ResolvedConfig {
 
 export const defaultFileClasses: readonly FileClass[] = [
   {
-    files: ["test/**", "tests/**", "scripts/**", "*.config.*", "**/__tests__/**", "**/fixtures/**", "**/*.test.*", "**/*.spec.*", "**/*.bench.*"],
+    files: ["test/**", "tests/**", "e2e/**", "scripts/**", "**/__tests__/**", "**/fixtures/**", "**/*.test.*", "**/*.spec.*", "**/*.bench.*"],
     policy: "development",
   },
 ]
 
-/** Build output and coverage reports under a package, never read. */
-export const packageOutput: readonly string[] = ["dist/**", "coverage/**"]
+/** Build output, static files and coverage reports under a package, never read. */
+export const packageOutput: readonly string[] = ["dist/**", "build/**", "public/**", "coverage/**"]
 
 const allManifestFields: readonly ManifestField[] = ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"]
 
@@ -158,6 +158,8 @@ const choices: Record<string, readonly unknown[]> = {
   requireDeclared: [true, false],
 }
 
+const isStringList = (value: unknown): boolean => Array.isArray(value) && value.every((item) => typeof item === "string")
+
 const unknownKeys = (where: string, value: unknown, allowed: readonly string[]): string[] =>
   typeof value === "object" && value !== null && !Array.isArray(value)
     ? Object.keys(value)
@@ -168,10 +170,6 @@ const unknownKeys = (where: string, value: unknown, allowed: readonly string[]):
 /** Problems that make a configuration unusable, as messages. A misspelled key is a problem, never a silent default. */
 export const configProblems = (config: Config): string[] => {
   const problems = unknownKeys("the configuration", config, allowedKeys.config)
-
-  if (!Array.isArray(config.workspaceScopes)) {
-    problems.push("workspaceScopes must be a list of scopes")
-  }
 
   if (typeof config.kinds !== "object" || config.kinds === null) {
     problems.push("kinds must map each kind to its rule")
@@ -188,6 +186,14 @@ export const configProblems = (config: Config): string[] => {
       problems.push(`kind ${name} names no packages`)
     }
 
+    if (kind.mayUse !== "any" && !isStringList(kind.mayUse)) {
+      problems.push(`kind ${name}: mayUse must be "any" or a list of kinds`)
+    }
+
+    if (kind.externals !== undefined && kind.externals !== "any" && !isStringList(kind.externals)) {
+      problems.push(`kind ${name}: externals must be "any" or a list of package names`)
+    }
+
     if (kind.mayUse !== "any") {
       for (const used of Array.isArray(kind.mayUse) ? kind.mayUse : []) {
         if (!kinds.has(used)) {
@@ -199,6 +205,20 @@ export const configProblems = (config: Config): string[] => {
 
   for (const [name, refinements] of Object.entries(config.packages ?? {})) {
     problems.push(...unknownKeys(`package ${name}`, refinements, allowedKeys.package))
+
+    for (const [key, value] of Object.entries(refinements)) {
+      if (!isStringList(value)) {
+        problems.push(`package ${name}: ${key} must be a list of strings`)
+      }
+    }
+  }
+
+  for (const key of ["workspaceScopes", "testOnlySpecifiers", "virtualModules", "ignore"] as const) {
+    const value: unknown = config[key]
+
+    if (value !== undefined && !isStringList(value)) {
+      problems.push(`${key} must be a list of strings`)
+    }
   }
 
   for (const [index, fileClass] of (config.fileClasses ?? []).entries()) {

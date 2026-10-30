@@ -3,6 +3,8 @@
  * it over every file and adds the whole-graph checks (`graph.ts`), so the two never disagree. Rules adapted from the
  * module graph checks of phibkro/file-transfer, phibkro/vektorprogrammet-reimagined and reebeat/reebeat.
  */
+import { readFileSync, statSync } from "node:fs"
+import nodePath from "node:path"
 import { resolveConfig, packageOutput } from "./config.ts"
 import type { BaselineEntry, Config, FilePolicy, ManifestField, ResolvedConfig, RuleName } from "./config.ts"
 import { matchesAny } from "./glob.ts"
@@ -32,6 +34,10 @@ export interface Engine {
   readonly resolver: Resolver
   /** The kind of a workspace package, or undefined when no kind's globs match its directory. */
   readonly kindOf: (entry: WorkspacePackage) => string | undefined
+  /** What each development file would break if it shipped, by file and modification time. */
+  readonly developmentVerdicts: Map<string, { readonly modified: number; readonly breaks: string | undefined }>
+  /** Development files being judged right now, so an import cycle between them ends. */
+  readonly judging: Set<string>
 }
 
 /** The source files the engine reads; anything else (`.vue`, `.json`) is no finding in either front end. */
@@ -46,7 +52,14 @@ export const createEngine = (root: string, config: Config): Engine => {
     kinds.set(entry.directory, Object.entries(resolved.kinds).find(([, kind]) => matchesAny(entry.directory, kind.packages))?.[0])
   }
 
-  return { workspace, config: resolved, resolver: makeResolver(workspace, resolved), kindOf: (entry) => kinds.get(entry.directory) }
+  return {
+    workspace,
+    config: resolved,
+    resolver: makeResolver(workspace, resolved),
+    kindOf: (entry) => kinds.get(entry.directory),
+    developmentVerdicts: new Map(),
+    judging: new Set(),
+  }
 }
 
 /** The policy of a package-relative file: the first file class that matches, else shipped. */
@@ -125,8 +138,59 @@ export const reads = (engine: Engine, file: string): boolean => {
   return owner !== undefined && !matchesAny(file.slice(owner.directory.length + 1), packageOutput)
 }
 
-/** Every finding for one file, before the baseline. `file` is repository-relative and `text` is its source. */
-export const findingsForFile = (engine: Engine, file: string, text: string): Finding[] => {
+/** The rules that hold for shipped code and not for development files. */
+const shippedOnlyRules: ReadonlySet<RuleName> = new Set([
+  "runtime-module",
+  "test-only-in-shipped",
+  "forbidden-external",
+  "undeclared-import",
+  "computed-import",
+  "shipped-imports-development-file",
+])
+
+/**
+ * What the development file `file` would break if it shipped (the first such finding, as a phrase), or undefined when it
+ * is fit to ship. Shipped code may import a development file (a shared helper under `scripts/`, a package-root config)
+ * only while this holds, so a test helper cannot launder `node:fs` or `fast-check` into shipped code.
+ */
+export const developmentFileBreaks = (engine: Engine, file: string): string | undefined => {
+  const absolute = nodePath.join(engine.workspace.root, file)
+  let modified: number
+
+  try {
+    modified = statSync(absolute).mtimeMs
+  } catch {
+    return undefined
+  }
+
+  const known = engine.developmentVerdicts.get(file)
+
+  if (known?.modified === modified) {
+    return known.breaks
+  }
+
+  if (engine.judging.has(file)) {
+    return undefined
+  }
+
+  engine.judging.add(file)
+
+  try {
+    const finding = findingsForFile(engine, file, readFileSync(absolute, "utf8"), true).find((candidate) => shippedOnlyRules.has(candidate.rule))
+    const breaks = finding === undefined ? undefined : `${finding.rule} at line ${finding.line}: ${finding.message}`
+    engine.developmentVerdicts.set(file, { modified, breaks })
+
+    return breaks
+  } finally {
+    engine.judging.delete(file)
+  }
+}
+
+/**
+ * Every finding for one file, before the baseline. `file` is repository-relative and `text` is its source. `asShipped`
+ * checks a development file as if it shipped (see `developmentFileBreaks`).
+ */
+export const findingsForFile = (engine: Engine, file: string, text: string, asShipped = false): Finding[] => {
   const { config, workspace } = engine
   const owner = packageOfFile(workspace, file)
 
@@ -135,7 +199,8 @@ export const findingsForFile = (engine: Engine, file: string, text: string): Fin
   }
 
   const packageRelative = file.slice(owner.directory.length + 1)
-  const policy = effectivePolicy(engine, owner, packageRelative)
+  const classified = effectivePolicy(engine, owner, packageRelative)
+  const policy = asShipped ? "shipped" : classified
 
   if (policy === "unchecked") {
     return []
@@ -178,7 +243,12 @@ export const findingsForFile = (engine: Engine, file: string, text: string): Fin
     const specifier = withoutQuery(site.specifier)
     const target = engine.resolver.resolve(file, site.specifier)
 
-    if (shipped && matchesAny(specifier, config.testOnlySpecifiers)) {
+    // Judged by what is written and by what it resolves to, so an alias (`#fc` for fast-check) hides nothing.
+    // A subpath (`@acme/conformance/guarantee`) is judged as written; only an alias adds the package it stands for.
+    const resolvedName = target.kind === "external" || target.kind === "workspace" ? target.name : undefined
+    const names = resolvedName === undefined || specifier.startsWith(resolvedName) ? [specifier] : [specifier, resolvedName]
+
+    if (shipped && names.some((name) => matchesAny(name, config.testOnlySpecifiers))) {
       report("test-only-in-shipped", site, `shipped code imports the test-only ${specifier}`, specifier)
     }
 
@@ -226,6 +296,22 @@ export const findingsForFile = (engine: Engine, file: string, text: string): Fin
           report(refusal.rule, site, refusal.why, to.name)
         }
 
+        // An exported subpath may point at a development file of that package (`@acme/quota/conformance`).
+        const toRelative = target.file?.slice(to.directory.length + 1)
+
+        if (shipped && !typeOnly && target.file !== undefined && toRelative !== undefined && effectivePolicy(engine, to, toRelative) !== "shipped") {
+          const breaks = developmentFileBreaks(engine, target.file)
+
+          if (breaks !== undefined) {
+            report(
+              "shipped-imports-development-file",
+              site,
+              `shipped code imports ${specifier}, a development file of ${to.name} (${target.file}) that ships ${breaks}`,
+              specifier,
+            )
+          }
+        }
+
         if (config.imports.requireDeclared && !declares(engine, owner, to.name, !shipped || typeOnly)) {
           report(
             "undeclared-import",
@@ -245,12 +331,16 @@ export const findingsForFile = (engine: Engine, file: string, text: string): Fin
           const where = to === undefined ? "a file outside every package" : `into ${to.name}`
           report("relative-import-leaves-package", site, `${specifier} reaches ${where}; import a package by its name`, specifier)
         } else if (shipped && !typeOnly && effectivePolicy(engine, owner, target.path.slice(owner.directory.length + 1)) !== "shipped") {
-          report(
-            "shipped-imports-development-file",
-            site,
-            `shipped code imports ${specifier}, a development file, which may use what shipped code may not; move what it needs into shipped code`,
-            specifier,
-          )
+          const breaks = developmentFileBreaks(engine, target.path)
+
+          if (breaks !== undefined) {
+            report(
+              "shipped-imports-development-file",
+              site,
+              `shipped code imports ${specifier}, a development file that would not pass as shipped code: ${breaks}`,
+              specifier,
+            )
+          }
         }
 
         break

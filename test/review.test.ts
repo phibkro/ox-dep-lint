@@ -1,8 +1,12 @@
 /** Negative controls for the bypasses and false positives the independent review of 0.1.0 found, one per finding. */
+import { mkdirSync, symlinkSync, writeFileSync } from "node:fs"
+import nodePath from "node:path"
 import { describe, expect, it } from "vite-plus/test"
+import { checkWorkspace } from "../src/check.ts"
 import type { Config } from "../src/config.ts"
 import { configProblems } from "../src/config.ts"
-import { findingsWith, validConfig, validWorkspace } from "./support/workspace.ts"
+import { findWorkspaceRoot } from "../src/workspace.ts"
+import { findingsWith, removeWorkspace, validConfig, validWorkspace, writeWorkspace } from "./support/workspace.ts"
 
 const library = "libraries/parcel/src/plant.ts"
 
@@ -52,18 +56,21 @@ describe("development files keep their edge checks (review finding 2)", () => {
 })
 
 describe("laundering through development files (review finding 3)", () => {
-  it("rejects shipped code importing a test or a script of its own package", () => {
-    expect(
-      findingsWith({
-        [library]: 'export * from "./plant.test.ts"\nexport * from "../scripts/helpers.ts"\n',
-        "libraries/parcel/src/plant.test.ts": "export const x = 1\n",
-        "libraries/parcel/scripts/helpers.ts": "export const y = 1\n",
-      }),
-    ).toEqual(["shipped-imports-development-file ../scripts/helpers.ts", "shipped-imports-development-file ./plant.test.ts"])
+  it("rejects shipped code importing a development file that would not pass as shipped code", () => {
+    const files = {
+      [library]: 'export * from "./plant.test.ts"\nexport * from "../scripts/helpers.ts"\n',
+      "libraries/parcel/src/plant.test.ts": 'import fc from "fast-check"\nexport const x = fc\n',
+      "libraries/parcel/scripts/helpers.ts": 'export * from "./deeper.ts"\n',
+      "libraries/parcel/scripts/deeper.ts": 'export { readFileSync } from "node:fs"\n',
+    }
+    expect(findingsWith(files)).toEqual(["shipped-imports-development-file ../scripts/helpers.ts", "shipped-imports-development-file ./plant.test.ts"])
   })
 
-  it("allows a type-only import of a development file", () => {
-    expect(findingsWith({ [library]: 'export type { X } from "./plant.test.ts"\n', "libraries/parcel/src/plant.test.ts": "export type X = 1\n" })).toEqual([])
+  it("allows a development file that would pass as shipped code, and any type-only import", () => {
+    expect(findingsWith({ [library]: 'export * from "../scripts/shared.ts"\n', "libraries/parcel/scripts/shared.ts": "export const shared = 1\n" })).toEqual([])
+    expect(
+      findingsWith({ [library]: 'export type { X } from "./plant.test.ts"\n', "libraries/parcel/src/plant.test.ts": 'import "node:fs"\nexport type X = 1\n' }),
+    ).toEqual([])
   })
 })
 
@@ -180,5 +187,138 @@ describe("workspace and configuration robustness (review findings 10, 16 and 18)
     expect(
       configProblems({ ...validConfig, baseline: [{ file: library, rule: "forbidden-edge", reason: "later" }] } as unknown as Config).join("\n"),
     ).toContain("names no target")
+  })
+})
+
+describe("the second review's findings", () => {
+  it("roots a workspace nested inside another checkout at its own manifest (H1)", () => {
+    const outer = writeWorkspace(validWorkspace)
+
+    try {
+      const inner = nodePath.join(outer, ".claude/worktrees/wt")
+      mkdirSync(nodePath.join(inner), { recursive: true })
+      writeFileSync(nodePath.join(inner, ".git"), "gitdir: elsewhere\n")
+      expect(findWorkspaceRoot(nodePath.join(inner, "libraries/parcel/src"))).toBeUndefined()
+      writeFileSync(nodePath.join(inner, "package.json"), JSON.stringify({ name: "wt", workspaces: ["libraries/*"] }))
+      expect(findWorkspaceRoot(nodePath.join(inner, "libraries/parcel/src"))).toBe(inner)
+      expect(findWorkspaceRoot(nodePath.join(outer, "libraries/parcel/src"))).toBe(outer)
+    } finally {
+      removeWorkspace(outer)
+    }
+  })
+
+  it("does not let a member's empty workspaces make it a root", () => {
+    const root = writeWorkspace({
+      ...validWorkspace,
+      "apps/web/package.json": { name: "@acme/web", workspaces: [], dependencies: { "@acme/parcel": "workspace:*" } },
+    })
+
+    try {
+      expect(findWorkspaceRoot(nodePath.join(root, "apps/web/src"))).toBe(root)
+    } finally {
+      removeWorkspace(root)
+    }
+  })
+
+  it("judges test-only specifiers by what an alias resolves to (H2)", () => {
+    const root = writeWorkspace({
+      ...validWorkspace,
+      "apps/web/package.json": { name: "@acme/web", dependencies: { "@acme/parcel": "workspace:*", "fast-check": "1" }, imports: { "#fc": "fast-check" } },
+      "apps/web/src/fuzz.ts": 'import fc from "#fc"\nexport const f = fc\n',
+      "node_modules/fast-check/package.json": { name: "fast-check", main: "index.js" },
+      "node_modules/fast-check/index.js": "export default 1\n",
+    })
+
+    try {
+      expect(checkWorkspace(root, validConfig).findings.map((finding) => `${finding.rule} ${finding.target ?? ""}`)).toContain("test-only-in-shipped #fc")
+    } finally {
+      removeWorkspace(root)
+    }
+  })
+
+  it("reads new URL only for source files, whatever query or fragment follows (M1, M2)", () => {
+    const source = [
+      'export const a = new URL("data.json", import.meta.url)',
+      'export const b = new URL("../cms", import.meta.url)',
+      'export const c = new URL("https://example.com/x.js", import.meta.url)',
+      'export const d = new Worker(new URL("../../../services/room/src/index.ts#/", import.meta.url))',
+    ].join("\n")
+    expect(findingsWith({ "apps/web/src/urls.ts": source })).toEqual(["relative-import-leaves-package ../../../services/room/src/index.ts"])
+  })
+
+  it("does not treat a computed resolve as a load (M3), and catches require passed around (M5)", () => {
+    expect(findingsWith({ "platforms/cloudflare/src/where.ts": "export const where = (entry: string) => import.meta.resolve(entry)\n" })).toEqual([])
+    expect(findingsWith({ "platforms/cloudflare/src/load.ts": "const load = require\nexport const x = (0, require)\n" })).toEqual([
+      "computed-import require",
+      "computed-import require",
+    ])
+  })
+
+  it("follows a workspace name a paths alias sends elsewhere (M7)", () => {
+    const files = {
+      "services/room/tsconfig.json": { compilerOptions: { paths: { "@acme/parcel": ["../../platforms/cloudflare/src/worker.ts"] } } },
+      "services/room/src/index.ts": 'export * from "@acme/parcel"\n',
+    }
+    expect(findingsWith(files)).toContain("forbidden-edge @acme/platform-cloudflare")
+  })
+
+  it("refuses wrongly typed configuration values (L3)", () => {
+    // SAFETY: deliberately not a Config, to see what validation says about it.
+    const problems = configProblems({
+      ...validConfig,
+      testOnlySpecifiers: "fast-check",
+      kinds: { ...validConfig.kinds, app: { packages: ["apps/*"] } },
+    } as unknown as Config).join("\n")
+    expect(problems).toContain("testOnlySpecifiers must be a list of strings")
+    expect(problems).toContain('kind app: mayUse must be "any" or a list of kinds')
+  })
+})
+
+describe("development files behind a package's exports (M6) and npm aliases (M8)", () => {
+  it("rejects shipped code importing an exported subpath that is a development file using test-only modules", () => {
+    const root = writeWorkspace({
+      ...validWorkspace,
+      "services/quota/package.json": {
+        name: "@acme/service-quota",
+        exports: { ".": "./src/index.ts", "./conformance": "./test/conformance.ts" },
+        dependencies: { "@acme/parcel": "workspace:*" },
+      },
+      "services/quota/test/conformance.ts": 'import fc from "fast-check"\nexport const suite = fc\n',
+      "platforms/cloudflare/src/suite.ts": 'export { suite } from "@acme/service-quota/conformance"\n',
+    })
+
+    try {
+      mkdirSync(nodePath.join(root, "node_modules/@acme"), { recursive: true })
+      symlinkSync(nodePath.join(root, "services/quota"), nodePath.join(root, "node_modules/@acme/service-quota"))
+      expect(checkWorkspace(root, validConfig).findings.map((finding) => `${finding.rule} ${finding.target ?? ""}`)).toEqual([
+        "shipped-imports-development-file @acme/service-quota/conformance",
+      ])
+    } finally {
+      removeWorkspace(root)
+    }
+  })
+
+  it("judges an npm alias by the name it is declared under, as bun's isolated store installs it", () => {
+    const config: Config = { ...validConfig, kinds: { ...validConfig.kinds, app: { packages: ["apps/*"], mayUse: ["library"], externals: ["vite"] } } }
+    const root = writeWorkspace({
+      ...validWorkspace,
+      "apps/web/package.json": { name: "@acme/web", dependencies: { "@acme/parcel": "workspace:*", vite: "npm:@voidzero-dev/vite-plus-core@1" } },
+      "apps/web/src/build.ts": 'import { build } from "vite"\nexport const b = build\n',
+      "node_modules/.bun/@voidzero-dev+vite-plus-core@1/node_modules/@voidzero-dev/vite-plus-core/package.json": {
+        name: "@voidzero-dev/vite-plus-core",
+        main: "index.js",
+      },
+      "node_modules/.bun/@voidzero-dev+vite-plus-core@1/node_modules/@voidzero-dev/vite-plus-core/index.js": "export const build = 1\n",
+    })
+
+    try {
+      symlinkSync(
+        nodePath.join(root, "node_modules/.bun/@voidzero-dev+vite-plus-core@1/node_modules/@voidzero-dev/vite-plus-core"),
+        nodePath.join(root, "node_modules/vite"),
+      )
+      expect(checkWorkspace(root, config).findings).toEqual([])
+    } finally {
+      removeWorkspace(root)
+    }
   })
 })

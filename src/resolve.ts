@@ -18,8 +18,8 @@ export type Target =
   | { readonly kind: "runtime"; readonly name: string }
   /** A bundler's virtual module (`virtual:pwa-register`): nothing on disk to check. */
   | { readonly kind: "virtual" }
-  /** A workspace package by its name. */
-  | { readonly kind: "workspace"; readonly name: string }
+  /** A workspace package: the one the import resolves into (a `paths` alias may spell another), and the file when found. */
+  | { readonly kind: "workspace"; readonly name: string; readonly file?: string }
   /** A name under a workspace scope that no package has. */
   | { readonly kind: "unknown-workspace"; readonly name: string }
   /** A package specifier with `.` or `..` segments after the name (`@acme/a/../b/src/x.ts`). */
@@ -60,8 +60,8 @@ const installedName = (path: string): string | undefined => {
   return first?.startsWith("@") === true ? `${first}/${parts[index + 2] ?? ""}` : first
 }
 
-/** Strips a query (`?raw`), never a leading `#` (a package import). */
-export const withoutQuery = (specifier: string): string => specifier.replace(/\?.*$/u, "")
+/** Strips a query (`?raw`) and a fragment, never a leading `#` (a package import). */
+export const withoutQuery = (specifier: string): string => specifier.charAt(0) + specifier.slice(1).replace(/[?#].*$/u, "")
 
 export const makeResolver = (workspace: Workspace, config: ResolvedConfig): Resolver => {
   const factory = new ResolverFactory({
@@ -92,7 +92,8 @@ export const makeResolver = (workspace: Workspace, config: ResolvedConfig): Reso
   const resolveFile = (importer: string, specifier: string) => {
     const first = factory.resolveFileSync(nodePath.join(realRoot, importer), specifier)
 
-    if (first.path !== undefined || first.builtin !== undefined) {
+    // A cached path to a file deleted since (an editor session) does not count as found.
+    if (first.builtin !== undefined || (first.path !== undefined && existsSync(first.path))) {
       return first
     }
 
@@ -126,7 +127,12 @@ export const makeResolver = (workspace: Workspace, config: ResolvedConfig): Reso
       }
 
       if (workspace.byName.has(name)) {
-        return { kind: "workspace", name }
+        // Resolved too: a `paths` alias may send a workspace name somewhere else, and the file decides the edge.
+        const found = resolveFile(importer, specifier).path
+        const file = found === undefined ? undefined : inside(found)
+        const owner = file === undefined ? undefined : packageOfFile(workspace, file)
+
+        return file === undefined ? { kind: "workspace", name } : { kind: "workspace", name: owner?.name ?? name, file }
       }
 
       if (config.workspaceScopes.some((scope) => specifier.startsWith(scope))) {
@@ -161,7 +167,11 @@ export const makeResolver = (workspace: Workspace, config: ResolvedConfig): Reso
       return aliasPrefixes.some((prefix) => specifier.startsWith(prefix)) ? { kind: "unresolved" } : { kind: "external", name, written: name }
     }
 
-    return { kind: "external", name: installedName(result.path) ?? name, written: name }
+    // An `npm:` alias keeps the name it is declared under, which is what a configuration names.
+    const importerPackage = packageOfFile(workspace, importer)
+    const aliased = importerPackage?.aliases.has(name) === true || workspace.rootAliases.has(name)
+
+    return { kind: "external", name: aliased ? name : (installedName(result.path) ?? name), written: name }
   }
 
   return { resolve, clear: () => factory.clearCache() }

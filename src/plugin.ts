@@ -48,9 +48,12 @@ const modified = (path: string): number => {
 }
 
 const manifestsOf = (root: string, engine: Engine | Error): Map<string, number> => {
+  const directories = engine instanceof Error ? [] : engine.workspace.packages.map((entry) => nodePath.join(root, entry.directory))
+  // The directories that hold packages too: adding a package there changes their modification time.
   const paths = [
     nodePath.join(root, "package.json"),
-    ...(engine instanceof Error ? [] : engine.workspace.packages.map((entry) => nodePath.join(root, entry.directory, "package.json"))),
+    ...directories.map((directory) => nodePath.join(directory, "package.json")),
+    ...new Set(directories.map((directory) => nodePath.dirname(directory))),
   ]
 
   return new Map(paths.map((path) => [path, modified(path)]))

@@ -69,4 +69,10 @@ const main = async () => {
   process.exitCode = result.findings.length === 0 ? 0 : 1
 }
 
-await main()
+try {
+  await main()
+} catch (error) {
+  // A configuration or workspace problem is a message, not a stack trace.
+  process.stderr.write(`ox-dep-lint: ${error instanceof Error ? error.message : String(error)}\n`)
+  process.exitCode = 2
+}
