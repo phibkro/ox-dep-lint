@@ -31,7 +31,8 @@
   "scripts": {
     "build": "vp pack",
     "check": "vp check --deny-warnings && vp test run",
-    "test": "vp test run"
+    "test": "vp test run",
+    "prepack": "vp pack"
   },
   "dependencies": {
     "oxc-parser": "0.153.0",
