@@ -239,6 +239,30 @@ describe("type-only imports", () => {
     expect(findingsWith({ ...inShipped, "apps/web/src/types.ts": express }, asValues)).toEqual([])
   })
 
+  it("judges every type-only form, not only import type", () => {
+    for (const source of [
+      'export type * from "bun"\n',
+      'export type S = import("bun").Socket\n',
+      'declare module "bun" {\n  interface Env {\n    readonly x: string\n  }\n}\n',
+      'import type B = require("bun")\nexport type S = B.Socket\n',
+    ]) {
+      expect(findingsWith({ [service]: source }), source).toEqual([])
+      expect(findingsWith({ [service]: source }, asValues), source).toEqual(["runtime-module bun"])
+    }
+  })
+
+  it("judges a runtime's types package as the runtime, never as an outside package", () => {
+    for (const [source, target] of [
+      ['/// <reference types="node" />\nexport {}\n', "node"],
+      ['/// <reference types="bun-types" />\nexport {}\n', "bun-types"],
+      ['import type { DurableObjectState } from "@cloudflare/workers-types"\nexport type S = DurableObjectState\n', "@cloudflare/workers-types"],
+    ] as const) {
+      expect(findingsWith({ [library]: source }, asValues), source).toEqual([`runtime-module ${target}`])
+      // A kind that may use runtime modules may reference their types, declared or not.
+      expect(findingsWith({ "platforms/cloudflare/src/types.ts": source }, asValues), source).toEqual([])
+    }
+  })
+
   it("keeps typeOnlyUses and development files as they were", () => {
     const config: Config = { ...asValues, packages: { ...validConfig.packages, "@acme/web": { typeOnlyUses: ["@acme/service-room"] } } }
     const manifest = { "apps/web/package.json": { name: "@acme/web", dependencies: { "@acme/parcel": "workspace:*", "@acme/service-room": "workspace:*" } } }

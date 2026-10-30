@@ -81,7 +81,7 @@ A kind may use its own kind only when `mayUse` lists it. `imports` holds the pol
 | `shippedFields`      | `dependencies`, `peerDependencies`, `optionalDependencies` | any subset       |
 | `typeOnly`           | `relaxed`                                                  | `as-values`      |
 
-`typeOnly: "as-values"` judges shipped code's type-only imports like value imports for `runtime-module`, `forbidden-external`, `undeclared-import` and `shipped-imports-development-file`, so `import type { Socket } from "bun"` fails in a kind without runtime modules. By default types do not load, so those rules skip them. Kind edges and `typeOnlyUses` always see the real form.
+`typeOnly: "as-values"` judges shipped code's type-only imports (`import type`, `export type`, type-level `import()`, `declare module`, `import type X = require()`, `/// <reference types>`) by `runtime-module`, `forbidden-external`, `undeclared-import` and `shipped-imports-development-file`, so `import type { Socket } from "bun"` fails in a kind without runtime modules. Two differences from value imports remain. A shipped field that declares `@types/x` declares `x` for a type-only import, and such an `@types/x` is an outside package too, so `externals` lists both. A runtime's own types package (`node` or `@types/node`, `bun`, `bun-types` or `@types/bun`, `@cloudflare/workers-types`) counts as that runtime, so it is judged by `runtime-module` and never needs declaring. By default types do not load, so those rules skip type-only imports. Kind edges and `typeOnlyUses` always see the real form.
 
 Misspelled keys, unknown policies and baseline entries without a `target` are configuration errors, never silent defaults.
 
