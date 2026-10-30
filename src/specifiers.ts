@@ -144,25 +144,30 @@ export const importForms = (path: string, source: string): ImportForms => {
 
   // `createRequire(import.meta.url)("x")` is read as a require of "x"; the inner call is then not a finding of its own.
   const appliedCreateRequire = new Set<number>()
-  // Every `require` written in the file, and the ones the visitor read as a call or may ignore (`x.require`, `typeof require`).
-  const requireIdentifiers: Spanned[] = []
-  const requireCallees: Spanned[] = []
-  const harmlessRequires = new Set<number>()
+  // `require` in a value position: passed, stored or returned, so the check cannot follow what it loads.
+  const sequenceCallees = new Set<number>()
 
-  const harmlessKey = (node: { readonly computed: boolean; readonly key: object }) => {
-    const key: { type?: unknown; name?: unknown; start?: unknown } = node.key
+  const requireValue = (node: object | null | undefined) => {
+    const candidate: { type?: unknown; name?: unknown; start?: unknown; end?: unknown } = node ?? {}
 
-    if (!node.computed && key.type === "Identifier" && key.name === "require" && typeof key.start === "number") {
-      harmlessRequires.add(key.start)
+    if (candidate.type === "Identifier" && candidate.name === "require" && typeof candidate.start === "number" && typeof candidate.end === "number") {
+      refuse({ start: candidate.start, end: candidate.end }, "require is used as a value, so the check cannot follow what it loads")
     }
   }
 
-  const bindParameters = (parameters: readonly { readonly type: string; readonly start: number; readonly name?: string }[]) => {
-    for (const parameter of parameters) {
-      if (parameter.type === "Identifier" && parameter.name === "require") {
-        harmlessRequires.add(parameter.start)
-      }
+  /** The `new URL(...)` inside `new URL(...).href` or `new URL(...).toString()`. */
+  const innermostUrl = (node: LiteralLike | undefined): LiteralLike | undefined => {
+    const shaped = node as (LiteralLike & { readonly object?: LiteralLike; readonly callee?: LiteralLike }) | undefined
+
+    if (shaped?.type === "MemberExpression") {
+      return shaped.object
     }
+
+    if (shaped?.type === "CallExpression" && shaped.callee?.type === "MemberExpression") {
+      return innermostUrl(shaped.callee)
+    }
+
+    return node
   }
 
   /**
@@ -170,7 +175,13 @@ export const importForms = (path: string, source: string): ImportForms => {
    * `new URL(..., import.meta.url)` anywhere else locates a file to read or an asset to serve, and loads nothing.
    */
   const readWorkerUrl = (argument: LiteralLike | undefined) => {
-    const url = argument as (LiteralLike & { readonly callee?: Spanned; readonly arguments?: readonly LiteralLike[] }) | undefined
+    // `new URL(...).href` and `new URL(...).toString()` are the same URL, as Vite and Bun both accept.
+    const unwrapped = /^(?<url>new\s*URL\s*\([\s\S]*\))\s*(?:\.\s*href|\.\s*toString\s*\(\s*\))$/u.test(
+      argument === undefined ? "" : text.slice(argument.start, argument.end),
+    )
+      ? innermostUrl(argument)
+      : argument
+    const url = unwrapped as (LiteralLike & { readonly callee?: Spanned; readonly arguments?: readonly LiteralLike[] }) | undefined
 
     if (url?.type !== "NewExpression" || url.callee === undefined || compact(text.slice(url.callee.start, url.callee.end)) !== "URL") {
       return
@@ -215,11 +226,19 @@ export const importForms = (path: string, source: string): ImportForms => {
       const callee = plainCallee(compact(text.slice(node.callee.start, node.callee.end)))
       const [first] = node.arguments
 
+      for (const argument of node.arguments) {
+        requireValue(argument)
+      }
+
+      if (node.callee.type === "SequenceExpression") {
+        sequenceCallees.add(node.callee.start)
+      } else if (node.callee.type === "ParenthesizedExpression" && node.callee.expression.type === "SequenceExpression") {
+        sequenceCallees.add(node.callee.expression.start)
+      }
+
       if (callee === "navigator.serviceWorker.register") {
         readWorkerUrl(first?.type === "SpreadElement" ? undefined : first)
       } else if (locators.has(callee)) {
-        requireCallees.push(node.callee)
-
         if (first !== undefined && first.type !== "SpreadElement" && spelled(first) !== undefined) {
           add(first, false)
         }
@@ -227,7 +246,6 @@ export const importForms = (path: string, source: string): ImportForms => {
         refuse(node, "import.meta.glob is not read yet, so the check cannot see what it loads")
       } else if (loaders.has(callee) || /^(?:module\.)?createRequire\(.*\)$/su.test(callee)) {
         appliedCreateRequire.add(node.callee.start)
-        requireCallees.push(node.callee)
 
         if (first === undefined || first.type === "SpreadElement") {
           refuse(node, "it names no module the check can read")
@@ -245,79 +263,59 @@ export const importForms = (path: string, source: string): ImportForms => {
         readWorkerUrl(node.arguments[0])
       }
     },
-    Identifier(node) {
-      if (node.name === "require") {
-        requireIdentifiers.push(node)
+    VariableDeclarator(node) {
+      requireValue(node.init)
+    },
+    AssignmentExpression(node) {
+      requireValue(node.right)
+    },
+    ArrayExpression(node) {
+      for (const element of node.elements) {
+        requireValue(element)
       }
     },
-    MemberExpression(node) {
-      // `x.require` names a property, not the loader; `require.resolve` is read as a call above.
-      if (!node.computed && node.property.type === "Identifier" && node.property.name === "require") {
-        harmlessRequires.add(node.property.start)
-      }
-
-      if (node.object.type === "Identifier" && node.object.name === "require") {
-        harmlessRequires.add(node.object.start)
+    ObjectExpression(node) {
+      // `{ require }` and `{ load: require }` pass the loader along; a destructuring pattern is not an ObjectExpression.
+      for (const property of node.properties) {
+        requireValue(property.type === "Property" ? property.value : property.argument)
       }
     },
-    Property(node) {
-      // `{ require: 1 }` names a key; the shorthand `{ require }` also passes the loader along, which is a use.
-      if (!node.computed && !node.shorthand && node.key.type === "Identifier" && node.key.name === "require") {
-        harmlessRequires.add(node.key.start)
-      }
+    ReturnStatement(node) {
+      requireValue(node.argument)
     },
-    MethodDefinition(node) {
-      harmlessKey(node)
+    ArrowFunctionExpression(node) {
+      requireValue(node.expression ? node.body : undefined)
     },
-    PropertyDefinition(node) {
-      harmlessKey(node)
+    ConditionalExpression(node) {
+      requireValue(node.consequent)
+      requireValue(node.alternate)
     },
-    TSPropertySignature(node) {
-      harmlessKey(node)
+    LogicalExpression(node) {
+      requireValue(node.left)
+      requireValue(node.right)
     },
-    TSMethodSignature(node) {
-      harmlessKey(node)
-    },
-    TSDeclareFunction(node) {
-      if (node.id?.name === "require") {
-        harmlessRequires.add(node.id.start)
-      }
-    },
-    TSTypeQuery(node) {
-      if (node.exprName.type === "Identifier" && node.exprName.name === "require") {
-        harmlessRequires.add(node.exprName.start)
-      }
-    },
-    ImportSpecifier(node) {
-      for (const name of [node.imported, node.local]) {
-        if (name.type === "Identifier" && name.name === "require") {
-          harmlessRequires.add(name.start)
+    SequenceExpression(node) {
+      // `(0, require)("x")` is read as a call; `(0, require)` alone hands the loader on.
+      if (!sequenceCallees.has(node.start)) {
+        for (const expression of node.expressions) {
+          requireValue(expression)
         }
       }
     },
-    VariableDeclarator(node) {
-      // A local named require is a binding, not a use (its calls are still read as loads).
-      if (node.id.type === "Identifier" && node.id.name === "require") {
-        harmlessRequires.add(node.id.start)
-      }
+    SpreadElement(node) {
+      requireValue(node.argument)
     },
-    FunctionDeclaration(node) {
-      bindParameters(node.params)
-
-      if (node.id?.name === "require") {
-        harmlessRequires.add(node.id.start)
-      }
+    ExportDefaultDeclaration(node) {
+      requireValue(node.declaration)
     },
-    FunctionExpression(node) {
-      bindParameters(node.params)
+    TSAsExpression(node) {
+      requireValue(node.expression)
     },
-    ArrowFunctionExpression(node) {
-      bindParameters(node.params)
+    TSSatisfiesExpression(node) {
+      requireValue(node.expression)
     },
-    UnaryExpression(node) {
-      if (node.operator === "typeof" && node.argument.type === "Identifier" && node.argument.name === "require") {
-        harmlessRequires.add(node.argument.start)
-      }
+    TSNonNullExpression(node) {
+      requireValue(node.expression)
     },
     TSImportEqualsDeclaration(node) {
       if (node.moduleReference.type === "TSExternalModuleReference") {
@@ -336,15 +334,6 @@ export const importForms = (path: string, source: string): ImportForms => {
   }).visit(program)
 
   // `const load = require`, `[require].map(...)`: a require passed around loads modules the check cannot follow.
-  // A shorthand property (`{ require }`) visits one identifier as both key and value.
-  for (const identifier of new Map(requireIdentifiers.map((node) => [node.start, node])).values()) {
-    const called = requireCallees.some((callee) => callee.start <= identifier.start && identifier.end <= callee.end)
-
-    if (!called && !harmlessRequires.has(identifier.start)) {
-      refuse(identifier, "require is used as a value, so the check cannot follow what it loads")
-    }
-  }
-
   for (const comment of comments) {
     const name = comment.type === "Line" ? typesReference.exec(comment.value.trim())?.groups?.name : undefined
 

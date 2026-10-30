@@ -181,6 +181,9 @@ export const developmentFileBreaks = (engine: Engine, file: string): string | un
     }
 
     read.set(next, time)
+    // The directory too: a file added beside it can change what its imports resolve to.
+    const directory = nodePath.dirname(next)
+    read.set(directory, modifiedTime(nodePath.join(engine.workspace.root, directory)) ?? -1)
     const reached: string[] = []
     const finding = findingsForFile(engine, next, readFileSync(absolute, "utf8"), { developmentImports: reached }).find((candidate) =>
       shippedOnlyRules.has(candidate.rule),
@@ -209,7 +212,8 @@ export const findingsForFile = (engine: Engine, file: string, text: string, opti
   const { config, workspace } = engine
   const owner = packageOfFile(workspace, file)
 
-  if (owner === undefined || !reads(engine, file)) {
+  // A file the check does not read (build output, an ignored path) is still judged when shipped code imports it.
+  if (owner === undefined || !sourceFile.test(file) || (!reads(engine, file) && developmentImports === undefined)) {
     return []
   }
 
@@ -316,7 +320,13 @@ export const findingsForFile = (engine: Engine, file: string, text: string, opti
         // An exported subpath may point at a development file of that package (`@acme/quota/conformance`), its own included.
         const toRelative = target.file?.slice(to.directory.length + 1)
 
-        if (shipped && !typeOnly && target.file !== undefined && toRelative !== undefined && effectivePolicy(engine, to, toRelative) !== "shipped") {
+        if (
+          shipped &&
+          !typeOnly &&
+          target.file !== undefined &&
+          toRelative !== undefined &&
+          (!reads(engine, target.file) || effectivePolicy(engine, to, toRelative) !== "shipped")
+        ) {
           judgeDevelopmentImport(target.file, `${specifier}, a development file of ${to.name} (${target.file}),`)
         }
 
@@ -352,6 +362,8 @@ export const findingsForFile = (engine: Engine, file: string, text: string, opti
         if (to?.name !== owner.name) {
           const where = to === undefined ? "a file outside every package" : `into ${to.name}`
           report("relative-import-leaves-package", site, `${specifier} reaches ${where}; import a package by its name`, specifier)
+        } else if (shipped && !typeOnly && !reads(engine, target.path)) {
+          judgeDevelopmentImport(target.path, `${specifier}, a file the check does not otherwise read (output or ignore),`)
         } else if (shipped && !typeOnly && effectivePolicy(engine, owner, target.path.slice(owner.directory.length + 1)) !== "shipped") {
           judgeDevelopmentImport(target.path, `${specifier}, a development file,`)
         }

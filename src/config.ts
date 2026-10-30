@@ -186,14 +186,57 @@ const unknownKeys = (where: string, value: unknown, allowed: readonly string[]):
     : [`${where} is not an object`]
 
 /** Problems that make a configuration unusable, as messages. A misspelled key is a problem, never a silent default. */
-export const configProblems = (config: Config): string[] => {
-  const problems = unknownKeys("the configuration", config, allowedKeys.config)
+const isObject = (value: unknown): boolean => typeof value === "object" && value !== null && !Array.isArray(value)
 
-  if (typeof config.kinds !== "object" || config.kinds === null) {
-    problems.push("kinds must map each kind to its rule")
-
-    return problems
+/** Problems with the configuration's outline (objects where objects belong, lists where lists belong), checked first. */
+const shapeProblems = (config: unknown): string[] => {
+  if (!isObject(config)) {
+    return ["the configuration must be an object"]
   }
+
+  const { kinds, packages, fileClasses, baseline } = config as Record<string, unknown>
+  const problems: string[] = []
+
+  if (!isObject(kinds)) {
+    problems.push("kinds must map each kind to its rule")
+  } else {
+    for (const [name, kind] of Object.entries(kinds as Record<string, unknown>)) {
+      if (!isObject(kind)) {
+        problems.push(`kind ${name} must be an object`)
+      }
+    }
+  }
+
+  if (packages !== undefined && !isObject(packages)) {
+    problems.push("packages must map package names to their rules")
+  } else {
+    for (const [name, rule] of Object.entries((packages ?? {}) as Record<string, unknown>)) {
+      if (!isObject(rule)) {
+        problems.push(`package ${name} must be an object`)
+      }
+    }
+  }
+
+  for (const [key, list] of [
+    ["fileClasses", fileClasses],
+    ["baseline", baseline],
+  ] as const) {
+    if (list !== undefined && (!Array.isArray(list) || !list.every(isObject))) {
+      problems.push(`${key} must be a list of objects`)
+    }
+  }
+
+  return problems
+}
+
+export const configProblems = (config: Config): string[] => {
+  const outline = shapeProblems(config)
+
+  if (outline.length > 0) {
+    return outline
+  }
+
+  const problems = unknownKeys("the configuration", config, allowedKeys.config)
 
   const kinds = new Set(Object.keys(config.kinds))
 

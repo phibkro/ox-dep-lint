@@ -166,8 +166,11 @@ export const makeResolver = (workspace: Workspace, config: ResolvedConfig): Reso
         const owner = file === undefined ? undefined : packageOfFile(workspace, file)
 
         if (found !== undefined && file === undefined && found.split(nodePath.sep).includes("node_modules")) {
-          // A paths alias that spells a workspace name but lands in an installed package is that package.
-          return { kind: "external", name: installedPackageName(found) ?? name, written: name }
+          // A paths alias that spells a workspace name but lands in another installed package is that package; an
+          // installed copy of the workspace package itself is still that workspace package.
+          const installed = installedPackageName(found) ?? name
+
+          return installed === name ? { kind: "workspace", name } : { kind: "external", name: installed, written: name }
         }
 
         return file === undefined ? { kind: "workspace", name } : { kind: "workspace", name: owner?.name ?? name, file }

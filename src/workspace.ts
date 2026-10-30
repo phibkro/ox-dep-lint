@@ -103,38 +103,44 @@ const workspacesOf = (manifest: string): readonly string[] => {
   }
 }
 
+/** Whether `globs` (from the manifest in `candidate`) hold `directory`: one of them matches it or a directory above it. */
+const holds = (candidate: string, globs: readonly string[], directory: string): boolean => {
+  const parts = nodePath
+    .relative(candidate, directory)
+    .split(nodePath.sep)
+    .filter((part) => part !== "")
+
+  return parts.some((_, index) => {
+    const prefix = parts.slice(0, index + 1).join("/")
+
+    return globs.some((glob) => matchesGlob(prefix, glob.replace(/^\.\//u, "").replace(/\/$/u, "")))
+  })
+}
+
 /**
- * The workspace root for a file in `start`: the nearest directory at or above it whose `package.json` declares
- * workspaces that hold `start` (one of its globs matches `start` or a directory above it), else the nearest one with
- * any workspaces at all. Nearest, so a worktree kept inside another checkout is its own workspace; holding, so a git
- * submodule or a member with its own stray `workspaces` still belongs to the workspace that lists it.
+ * The workspace root for a file in `start`. The nearest directory whose `package.json` `workspaces` hold `start` is a
+ * root; while a manifest further up holds that root in turn (a member that declares workspaces of its own), the root
+ * moves up to it. With no manifest holding `start`, the nearest one with any workspaces. So a worktree kept inside
+ * another checkout is its own workspace, and a nested member or a git submodule belongs to the workspace that lists it.
  */
 export const findWorkspaceRoot = (start: string): string | undefined => {
   const directory = nodePath.resolve(start)
   let nearest: string | undefined
+  let root: string | undefined
 
   for (let candidate = directory; ; candidate = nodePath.dirname(candidate)) {
     const globs = workspacesOf(nodePath.join(candidate, "package.json")).filter((glob) => !glob.startsWith("!"))
 
     if (globs.length > 0) {
       nearest ??= candidate
-      const parts = nodePath
-        .relative(candidate, directory)
-        .split(nodePath.sep)
-        .filter((part) => part !== "")
-      const holds = parts.some((_, index) => {
-        const prefix = parts.slice(0, index + 1).join("/")
 
-        return globs.some((glob) => matchesGlob(prefix, glob.replace(/^\.\//u, "").replace(/\/$/u, "")))
-      })
-
-      if (holds || parts.length === 0) {
-        return candidate
+      if (candidate === directory || holds(candidate, globs, root ?? directory)) {
+        root = candidate
       }
     }
 
     if (nodePath.dirname(candidate) === candidate) {
-      return nearest
+      return root ?? nearest
     }
   }
 }

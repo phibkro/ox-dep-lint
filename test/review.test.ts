@@ -343,7 +343,8 @@ describe("development files behind a package's exports (M6) and npm aliases (M8)
 describe("the third review's findings", () => {
   it("reads build output when output says so (H-A)", () => {
     const files = { [library]: 'export * from "../dist/helper.ts"\n', "libraries/parcel/dist/helper.ts": 'export { readFileSync } from "node:fs"\n' }
-    expect(findingsWith(files)).toEqual([])
+    // Not read on its own, but judged where shipped code imports it (round 3, M-D).
+    expect(findingsWith(files)).toEqual(["shipped-imports-development-file ../dist/helper.ts"])
     expect(findingsWith(files, { ...validConfig, output: [] })).toEqual(["runtime-module node:fs"])
   })
 
@@ -468,5 +469,54 @@ describe("the third review's findings", () => {
     ]) {
       expect(problems).toContain(expected)
     }
+  })
+})
+
+describe("the fourth review's findings", () => {
+  it("reads a worker URL passed as .href or .toString() (M-A)", () => {
+    const source = [
+      'export const a = new Worker(new URL("../../../platforms/cloudflare/src/worker.ts", import.meta.url).href)',
+      'export const b = new SharedWorker(new URL("../../../services/room/src/index.ts", import.meta.url).toString())',
+    ].join("\n")
+    expect(findingsWith({ "apps/web/src/workers.ts": source })).toEqual([
+      "relative-import-leaves-package ../../../platforms/cloudflare/src/worker.ts",
+      "relative-import-leaves-package ../../../services/room/src/index.ts",
+    ])
+  })
+
+  it("roots a file under a member that declares its own workspaces at the workspace listing that member (M-B)", () => {
+    const root = writeWorkspace({
+      ...validWorkspace,
+      "libraries/parcel/package.json": { name: "@acme/parcel", workspaces: ["examples/*"], dependencies: { effect: "1" } },
+    })
+
+    try {
+      expect(findWorkspaceRoot(nodePath.join(root, "libraries/parcel/examples/demo/src"))).toBe(root)
+      expect(findWorkspaceRoot(nodePath.join(root, "libraries/parcel/src"))).toBe(root)
+    } finally {
+      removeWorkspace(root)
+    }
+  })
+
+  it("flags require only where it is handed on as a value (M-C)", () => {
+    const source = [
+      "export const pick = ({ require }: { require: boolean }) => (require ? 1 : 0)",
+      "export interface Loader { load(require: boolean): void }",
+      "export declare function g(require: boolean): void",
+      "export abstract class A { abstract require(): void }",
+      "export enum E { require }",
+      "export type Cache = typeof require.cache",
+      "export const options = { require: true }",
+    ].join("\n")
+    expect(findingsWith({ "platforms/cloudflare/src/names.ts": source })).toEqual([])
+  })
+
+  it("judges an imported file under output or ignore, which is not read on its own (M-D)", () => {
+    const files = { [library]: 'export * from "../coverage/helper.ts"\n', "libraries/parcel/coverage/helper.ts": 'export { readFileSync } from "node:fs"\n' }
+    expect(findingsWith(files)).toEqual(["shipped-imports-development-file ../coverage/helper.ts"])
+    const ignored = { [library]: 'export * from "./generated.ts"\n', "libraries/parcel/src/generated.ts": 'export { readFileSync } from "node:fs"\n' }
+    expect(findingsWith(ignored, { ...validConfig, ignore: ["libraries/parcel/src/generated.ts"] })).toEqual([
+      "shipped-imports-development-file ./generated.ts",
+    ])
   })
 })
