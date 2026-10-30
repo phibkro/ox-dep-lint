@@ -4,6 +4,7 @@
  * module graph checks of phibkro/file-transfer, phibkro/vektorprogrammet-reimagined and reebeat/reebeat.
  */
 import { readFileSync, statSync } from "node:fs"
+import { builtinModules } from "node:module"
 import nodePath from "node:path"
 import { resolveConfig } from "./config.ts"
 import type { BaselineEntry, Config, FilePolicy, ManifestField, ResolvedConfig, RuleName } from "./config.ts"
@@ -14,14 +15,19 @@ import { importForms } from "./specifiers.ts"
 import { loadWorkspace, packageNameOf, packageOfFile } from "./workspace.ts"
 import type { Workspace, WorkspacePackage } from "./workspace.ts"
 
-/** Packages that hold a runtime's types, and the runtime module each describes. */
-const runtimeTypePackages: Readonly<Record<string, string>> = {
-  node: "node:module",
-  "@types/node": "node:module",
-  bun: "bun",
-  "bun-types": "bun",
-  "@types/bun": "bun",
-  "@cloudflare/workers-types": "cloudflare:workers",
+const nodeModules = ["node:module", ...builtinModules]
+
+/**
+ * Packages that hold a runtime's types, and the runtime modules they describe: the package counts as the runtime when
+ * the configuration names any of them a runtime module (Node's by its `node:` prefix or any bare built-in).
+ */
+const runtimeTypePackages: Readonly<Record<string, readonly string[]>> = {
+  node: nodeModules,
+  "@types/node": nodeModules,
+  bun: ["bun"],
+  "bun-types": ["bun"],
+  "@types/bun": ["bun"],
+  "@cloudflare/workers-types": ["cloudflare:workers"],
 }
 
 export interface Finding {
@@ -273,9 +279,9 @@ export const findingsForFile = (engine: Engine, file: string, text: string, opti
    * `runtime-module` like `node:fs` and never as an outside package to declare.
    */
   const runtimeOf = (site: { readonly specifier: string; readonly typeOnly: boolean }): string | undefined => {
-    const runtime = site.typeOnly ? runtimeTypePackages[packageNameOf(site.specifier)] : undefined
+    const modules = site.typeOnly ? runtimeTypePackages[packageNameOf(site.specifier)] : undefined
 
-    return runtime !== undefined && isRuntimeModule(config, runtime) ? runtime : undefined
+    return modules?.find((module) => isRuntimeModule(config, module))
   }
 
   for (const site of forms.imports) {

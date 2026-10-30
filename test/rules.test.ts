@@ -263,6 +263,20 @@ describe("type-only imports", () => {
     }
   })
 
+  it("maps a types package's subpaths too, and judges a value import of one as an outside package", () => {
+    expect(findingsWith({ [library]: 'import type { Expect } from "bun-types/test"\nexport type E = Expect\n' }, asValues)).toEqual([
+      "runtime-module bun-types/test",
+    ])
+    expect(findingsWith({ [library]: 'import "bun-types"\n' })).toEqual(["forbidden-external bun-types", "undeclared-import bun-types"])
+  })
+
+  it("counts Node's types as Node when the configuration names Node only by its bare built-ins", () => {
+    const bareOnly: Config = { ...asValues, runtimeModules: { prefixes: ["bun:", "cloudflare:"], names: ["bun", "fs"] } }
+    const source = '/// <reference types="node" />\nexport {}\n'
+    expect(findingsWith({ [library]: source }, bareOnly)).toEqual(["runtime-module node"])
+    expect(findingsWith({ "platforms/cloudflare/src/types.ts": source }, bareOnly)).toEqual([])
+  })
+
   it("keeps typeOnlyUses and development files as they were", () => {
     const config: Config = { ...asValues, packages: { ...validConfig.packages, "@acme/web": { typeOnlyUses: ["@acme/service-room"] } } }
     const manifest = { "apps/web/package.json": { name: "@acme/web", dependencies: { "@acme/parcel": "workspace:*", "@acme/service-room": "workspace:*" } } }
