@@ -1,0 +1,103 @@
+# Turns the changesets merged to main into a release, by semantic versioning:
+#   1. after `check` passes on a push to main, and changesets are waiting in .changeset/, `changeset version` bumps
+#      package.json by the largest bump they declare (patch, minor, major) and writes CHANGELOG.md from them;
+#   2. that is committed to main as "chore(release): vX.Y.Z" and tagged vX.Y.Z;
+#   3. the push of the tag starts release.yml, which publishes to npm through trusted publishing.
+# The commit and the tag are pushed with a deploy key (secret RELEASE_DEPLOY_KEY of the `version` environment, which
+# only main may use): unlike the workflow's own token, a deploy key's push starts other workflows, and it can be put on
+# a ruleset's bypass list if main requires pull requests. The release commit's own `check` run finds no changesets.
+# Adapted from file-transfer's release workflow (phibkro/file-transfer, docs/decisions/0023), same author.
+name: version
+on:
+  workflow_run:
+    workflows: [check]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: version
+  cancel-in-progress: false
+jobs:
+  pending:
+    # Whether anything waits, decided without the environment, so pushes that release nothing never touch the key.
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.current.outputs.commit }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+      - name: Release only the commit the checks passed on, when changesets wait
+        id: current
+        env:
+          CHECKED: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          if [ -n "$CHECKED" ] && [ "$(git rev-parse HEAD)" != "$CHECKED" ]; then
+            echo "main moved on since the checked commit; the run for the newer commit releases it"
+          elif [ -z "$(find .changeset -name '*.md' ! -name README.md -print -quit)" ]; then
+            echo "no changesets waiting; nothing to release"
+          else
+            echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
+  version:
+    needs: [pending]
+    if: needs.pending.outputs.commit != ''
+    runs-on: ubuntu-latest
+    environment: version
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
+      - name: Check the key and the commit
+        id: current
+        env:
+          PENDING: ${{ needs.pending.outputs.commit }}
+          HAS_KEY: ${{ secrets.RELEASE_DEPLOY_KEY != '' }}
+        run: |
+          if [ "$HAS_KEY" != true ]; then
+            echo "::error::the version environment has no RELEASE_DEPLOY_KEY secret, so the release cannot be pushed"
+            exit 1
+          elif [ "$(git rev-parse HEAD)" != "$PENDING" ]; then
+            echo "main moved on while waiting; the run for the newer commit releases it"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        if: steps.current.outputs.skip != 'true'
+        with:
+          bun-version: 1.4.4
+      - if: steps.current.outputs.skip != 'true'
+        run: bun install --frozen-lockfile
+      - name: Bump the version and write the changelog
+        id: bump
+        if: steps.current.outputs.skip != 'true'
+        run: |
+          before=$(node -p 'require("./package.json").version')
+          bunx --no-install changeset version
+          bunx --no-install vp fmt CHANGELOG.md package.json
+          after=$(node -p 'require("./package.json").version')
+          # Only empty changesets: nothing ships, so no release; their files are consumed in the commit below all the same.
+          if [ "$before" != "$after" ]; then echo "version=$after" >> "$GITHUB_OUTPUT"; fi
+      - name: Commit and tag the release
+        if: steps.current.outputs.skip != 'true'
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if [ -n "$VERSION" ]; then
+            git commit -q -m "chore(release): v$VERSION" -m "Version and changelog from the changesets merged since the last release."
+            git tag -a "v$VERSION" -m "ox-dep-lint $VERSION"
+            git push origin HEAD:main "v$VERSION"
+          else
+            git commit -q -m "chore: consume empty changesets" -m "They changed nothing that ships, so there is no release."
+            git push origin HEAD:main
+          fi
