@@ -6,7 +6,7 @@ import { existsSync, lstatSync, readdirSync, readFileSync, statSync } from "node
 import nodePath from "node:path"
 import type { ManifestField } from "./config.ts"
 import { matchesGlob } from "./glob.ts"
-import { attempt, codeOf, failure, messageOf, success } from "./result.ts"
+import { attempt, codeOf, failure, messageOf, success, vanished } from "./result.ts"
 import type { Result } from "./result.ts"
 
 export interface WorkspacePackage {
@@ -40,16 +40,28 @@ interface Manifest {
   readonly peerDependencies?: unknown
 }
 
+/** Why a manifest cannot be read, and whether that is because it is no longer there (removed since it was found). */
+interface ManifestFailure {
+  readonly message: string
+  readonly vanished: boolean
+}
+
 /** The manifest at `path`, or why it cannot be read. */
-const readManifest = (path: string): Result<Manifest, string> => {
-  const parsed = attempt((): unknown => JSON.parse(readFileSync(path, "utf8")))
+const readManifest = (path: string): Result<Manifest, ManifestFailure> => {
+  const text = attempt(() => readFileSync(path, "utf8"))
+
+  if (!text.ok) {
+    return failure({ message: `${path}: ${messageOf(text.error)}`, vanished: vanished(text.error) })
+  }
+
+  const parsed = attempt((): unknown => JSON.parse(text.value))
 
   if (!parsed.ok) {
-    return failure(`${path}: ${messageOf(parsed.error)}`)
+    return failure({ message: `${path}: ${messageOf(parsed.error)}`, vanished: false })
   }
 
   if (typeof parsed.value !== "object" || parsed.value === null) {
-    return failure(`${path} is not a JSON object`)
+    return failure({ message: `${path} is not a JSON object`, vanished: false })
   }
 
   return success(parsed.value)
@@ -204,7 +216,10 @@ export const directoriesMatching = (root: string, pattern: string, unlisted?: Un
     const listed = attempt(() => readdirSync(nodePath.join(root, relative), { withFileTypes: true }))
 
     if (!listed.ok) {
-      unlisted?.unreadable.push({ directory: relative, code: codeOf(listed.error) })
+      // Removed (or replaced by a file) since it was found: nothing is left to list or report.
+      if (!vanished(listed.error)) {
+        unlisted?.unreadable.push({ directory: relative, code: codeOf(listed.error) })
+      }
 
       return
     }
@@ -234,7 +249,10 @@ export const directoriesMatching = (root: string, pattern: string, unlisted?: Un
     return existsSync(nodePath.join(root, base)) ? [base] : []
   }
 
-  if (existsSync(nodePath.join(root, base)) && statSync(nodePath.join(root, base)).isDirectory()) {
+  // One look rather than `existsSync` then `statSync`, so a base removed in between is no error.
+  const status = attempt(() => statSync(nodePath.join(root, base)))
+
+  if (status.ok && status.value.isDirectory()) {
     walk(base, base === "" ? 0 : base.split("/").length)
   }
 
@@ -245,7 +263,7 @@ export const loadWorkspace = (root: string): Workspace => {
   const rootRead = readManifest(nodePath.join(root, "package.json"))
 
   if (!rootRead.ok) {
-    throw new Error(rootRead.error)
+    throw new Error(rootRead.error.message)
   }
 
   const rootManifest = rootRead.value
@@ -275,8 +293,13 @@ export const loadWorkspace = (root: string): Workspace => {
   for (const directory of [...directories].toSorted()) {
     const read = readManifest(nodePath.join(root, directory, "package.json"))
 
+    // A member removed since the glob found it is no member; one whose package.json cannot be read for another reason is a finding.
+    if (!read.ok && read.error.vanished) {
+      continue
+    }
+
     if (!read.ok) {
-      problems.push({ directory, message: `package.json cannot be read: ${read.error}` })
+      problems.push({ directory, message: `package.json cannot be read: ${read.error.message}` })
       continue
     }
 

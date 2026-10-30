@@ -19,7 +19,7 @@ import {
 } from "./engine.ts"
 import type { Engine, Finding } from "./engine.ts"
 import { matchesGlob } from "./glob.ts"
-import { codeOf } from "./result.ts"
+import { attempt, codeOf, vanished } from "./result.ts"
 import { directoriesMatching } from "./workspace.ts"
 import type { Unlisted } from "./workspace.ts"
 
@@ -143,17 +143,6 @@ const isFile = (absolute: string): boolean => {
   }
 }
 
-/** The error code of a directory that cannot be listed, or undefined when it can. */
-const unreadable = (absolute: string): string | undefined => {
-  try {
-    readdirSync(absolute)
-
-    return undefined
-  } catch (cause) {
-    return codeOf(cause)
-  }
-}
-
 /**
  * What the root's `workspaces` globs (and a kind's globs) match that is no package: a directory without a
  * `package.json`, whose files no package owns and so nothing checks (only the topmost of nested ones); a dot directory,
@@ -186,18 +175,21 @@ const directoriesWithoutPackage = (engine: Engine, members: ReadonlySet<string>,
       return undefined
     }
 
-    const code = unreadable(nodePath.join(workspace.root, directory))
+    const listed = attempt(() => readdirSync(nodePath.join(workspace.root, directory)))
 
-    return code === undefined
-      ? {
-          rule: "directory-without-package",
-          file: directory,
-          line: 1,
-          column: 0,
-          message: `${directory} matches the workspaces glob ${glob} but has no package.json, so no package owns what it holds and nothing in it is checked: make it a package, remove it, or add ${directory}/** to ignore`,
-          target: directory,
-        }
-      : unreadablePathFinding(directory, code)
+    if (!listed.ok) {
+      // Removed since the glob matched it: no directory is left to report.
+      return vanished(listed.error) ? undefined : unreadablePathFinding(directory, codeOf(listed.error))
+    }
+
+    return {
+      rule: "directory-without-package",
+      file: directory,
+      line: 1,
+      column: 0,
+      message: `${directory} matches the workspaces glob ${glob} but has no package.json, so no package owns what it holds and nothing in it is checked: make it a package, remove it, or add ${directory}/** to ignore`,
+      target: directory,
+    }
   }
 
   const dotDirectory = (directory: string): Finding => ({
@@ -217,8 +209,11 @@ const directoriesWithoutPackage = (engine: Engine, members: ReadonlySet<string>,
     // A link to a file is no package, as a file there is none; a link to a directory, or to nothing, may be one.
     ...unlisted.links.map((link) => ({
       path: link,
-      finding: () =>
-        isFile(nodePath.join(workspace.root, link)) ? undefined : symbolicLinkFinding(link, linkDestination(nodePath.join(workspace.root, link))),
+      finding: () => {
+        const destination = isFile(nodePath.join(workspace.root, link)) ? undefined : linkDestination(nodePath.join(workspace.root, link))
+
+        return destination === undefined ? undefined : symbolicLinkFinding(link, destination)
+      },
     })),
   ].toSorted((left, right) => left.path.split("/").length - right.path.split("/").length || left.path.localeCompare(right.path))
 

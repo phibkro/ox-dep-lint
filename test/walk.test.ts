@@ -2,38 +2,69 @@
  * What the walk cannot see through: symbolic links (reported, never followed), directories it cannot list, and
  * directories the workspaces match that no package owns. Each case plants one thing in the valid workspace.
  */
-import { chmodSync, mkdirSync, readdirSync, readFileSync, symlinkSync } from "node:fs"
+import { chmodSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import nodePath from "node:path"
 import { describe, expect, it, vi } from "vite-plus/test"
 import { checkWorkspace, listSourceFiles } from "../src/check.ts"
 import type { Config } from "../src/config.ts"
 import { defaultFileClasses } from "../src/config.ts"
-import { createEngine } from "../src/engine.ts"
+import { createEngine, findingsForFile } from "../src/engine.ts"
 import type { Files } from "./support/workspace.ts"
 import { removeWorkspace, validConfig, validWorkspace, writeWorkspace, writeWorkspaceFiles } from "./support/workspace.ts"
 
 /** Paths whose listing or reading fails with EACCES, whoever runs the test (root reads a path whatever its mode). */
 const denied = vi.hoisted(() => new Set<string>())
 
+/**
+ * Changes to the disk to make right after one call returns, keyed by `operation absolute-path` (`readdirSync /tmp/x/src`),
+ * each made once. So a test removes an entry after the check listed or found it and before it reads it, as a test
+ * running beside the check did in tsukuri, without relying on a race.
+ */
+const afterCall = vi.hoisted(() => new Map<string, () => void>())
+
 vi.mock(import("node:fs"), async (importOriginal) => {
   const actual = await importOriginal()
-  /** `call` for a path not in `denied`, with its arguments unchanged; for one in `denied`, the error a mode of 000 gives. */
-  const denying =
-    (call: (path: string, options?: unknown) => unknown, operation: string) =>
+  /**
+   * `call` with its arguments unchanged, then the change `afterCall` holds for it. With a `syscall`, a path in `denied`
+   * throws the error a mode of 000 gives instead.
+   */
+  const instrumented =
+    (call: (path: string, options?: unknown) => unknown, operation: string, syscall?: string) =>
     (path: string, options?: unknown): unknown => {
-      if (denied.has(String(path))) {
-        throw Object.assign(new Error(`EACCES: permission denied, ${operation} '${String(path)}'`), { code: "EACCES" })
+      if (syscall !== undefined && denied.has(String(path))) {
+        throw Object.assign(new Error(`EACCES: permission denied, ${syscall} '${String(path)}'`), { code: "EACCES" })
       }
 
-      return call(path, options)
+      const result = call(path, options)
+      const key = `${operation} ${String(path)}`
+      const change = afterCall.get(key)
+
+      if (change !== undefined) {
+        afterCall.delete(key)
+        change()
+      }
+
+      return result
     }
   // SAFETY: each wrapper passes every call through unchanged (so it returns what that overload returns) or throws.
-  const readdirSync = denying(actual.readdirSync as (path: string, options?: unknown) => unknown, "scandir") as typeof actual.readdirSync
+  const readdirSync = instrumented(actual.readdirSync as (path: string, options?: unknown) => unknown, "readdirSync", "scandir") as typeof actual.readdirSync
   // SAFETY: as above.
-  const readFileSync = denying(actual.readFileSync as (path: string, options?: unknown) => unknown, "open") as typeof actual.readFileSync
+  const readFileSync = instrumented(actual.readFileSync as (path: string, options?: unknown) => unknown, "readFileSync", "open") as typeof actual.readFileSync
+  // SAFETY: as above.
+  const existsSync = instrumented(actual.existsSync as (path: string, options?: unknown) => unknown, "existsSync") as typeof actual.existsSync
+  // SAFETY: as above.
+  const statSync = instrumented(actual.statSync as (path: string, options?: unknown) => unknown, "statSync") as typeof actual.statSync
+  // SAFETY: as above.
+  const lstatSync = instrumented(actual.lstatSync as (path: string, options?: unknown) => unknown, "lstatSync") as typeof actual.lstatSync
+  const replaced = { readdirSync, readFileSync, existsSync, statSync, lstatSync }
 
-  return { ...actual, default: { ...actual, readdirSync, readFileSync }, readdirSync, readFileSync }
+  return { ...actual, default: { ...actual, ...replaced }, ...replaced }
 })
+
+/** Makes `change` right after the `nth` `operation` on the repository-relative `path` under `root` returns. */
+const after = (operation: string, root: string, path: string, change: () => void, nth = 1) => {
+  afterCall.set(`${operation} ${nodePath.join(root, path)}`, nth === 1 ? change : () => after(operation, root, path, change, nth - 1))
+}
 
 /** A path to link from (repository-relative) and the destination the link names, as written. */
 type Links = Readonly<Record<string, string>>
@@ -55,6 +86,7 @@ const check = (changes: Files, links: Links = {}, config: Config = validConfig, 
       .toSorted()
   } finally {
     denied.clear()
+    afterCall.clear()
     removeWorkspace(root)
   }
 }
@@ -322,6 +354,117 @@ describe("directories the walk cannot read", () => {
       chmodSync(locked, 0o755)
       removeWorkspace(root)
     }
+  })
+})
+
+describe("paths that disappear while the check runs", () => {
+  /** What a library may not import: had the check read a file that disappeared, it would say so. */
+  const forbidden = 'import "@acme/platform-cloudflare"\n'
+  const remove = (root: string, path: string) => () => rmSync(nodePath.join(root, path), { recursive: true, force: true })
+  /** Removes the directory at `path` and writes a file in its place, so a read through it fails with ENOTDIR. */
+  const replaceWithFile = (root: string, path: string) => () => {
+    rmSync(nodePath.join(root, path), { recursive: true, force: true })
+    writeFileSync(nodePath.join(root, path), "")
+  }
+
+  it("skips a source file removed between listing and reading (ENOENT)", () => {
+    expect(
+      check({ [`${source}/vanishing.ts`]: forbidden }, {}, validConfig, (root) => after("readdirSync", root, source, remove(root, `${source}/vanishing.ts`))),
+    ).toEqual([])
+  })
+
+  it("skips a directory removed between listing its parent and listing it (tsukuri's .scan-x)", () => {
+    expect(
+      check({ "tools/quality/.scan-x/packages/probe/src/index.ts": "export {}\n" }, {}, validConfig, (root) =>
+        after("readdirSync", root, "tools/quality", remove(root, "tools/quality/.scan-x")),
+      ),
+    ).toEqual([])
+  })
+
+  it("skips a directory replaced by a file before it is listed (ENOTDIR)", () => {
+    expect(
+      check({ [`${source}/deep/x.ts`]: forbidden }, {}, validConfig, (root) => after("readdirSync", root, source, replaceWithFile(root, `${source}/deep`))),
+    ).toEqual([])
+  })
+
+  it("skips a source file whose directory is replaced by a file before it is read (ENOTDIR)", () => {
+    expect(
+      check({ [`${source}/deep/x.ts`]: forbidden }, {}, validConfig, (root) =>
+        after("readdirSync", root, `${source}/deep`, replaceWithFile(root, `${source}/deep`)),
+      ),
+    ).toEqual([])
+  })
+
+  it("skips a symbolic link removed before its destination is read", () => {
+    expect(
+      check({ ...elsewhere }, { [`${source}/link`]: "../../../elsewhere" }, validConfig, (root) =>
+        after("readdirSync", root, source, remove(root, `${source}/link`)),
+      ),
+    ).toEqual([])
+  })
+
+  it("skips a development file removed between the shipped import that reaches it and its read", () => {
+    expect(
+      check(
+        { "apps/web/scripts/helper.ts": "export const helper = 1\n", "apps/web/src/uses.ts": 'export { helper } from "../scripts/helper.ts"\n' },
+        {},
+        validConfig,
+        (root) => after("statSync", root, "apps/web/scripts/helper.ts", remove(root, "apps/web/scripts/helper.ts")),
+      ),
+    ).toEqual([])
+  })
+
+  it("skips a member removed between the workspaces glob matching it and its package.json being read", () => {
+    expect(
+      check({ "tools/gone/package.json": { name: "@acme/gone" }, "tools/gone/src/index.ts": "export {}\n" }, {}, validConfig, (root) =>
+        after("existsSync", root, "tools/gone/package.json", remove(root, "tools/gone")),
+      ),
+    ).toEqual([])
+  })
+
+  it("skips a directory a ** workspaces glob lists and then loses", () => {
+    const root = { ...(validWorkspace["package.json"] as object), workspaces: ["libraries/**", "services/*", "platforms/*", "apps/*", "tools/*"] }
+    expect(
+      check({ "package.json": root, "libraries/gone/a/x.ts": "export {}\n" }, {}, validConfig, (workspace) =>
+        // The third listing of libraries: the workspace's, the library kind's, then the one that reports what it cannot list.
+        after("readdirSync", workspace, "libraries", remove(workspace, "libraries/gone"), 3),
+      ),
+    ).toEqual([])
+  })
+
+  it("skips, as the plugin does per file, a link removed before its destination is read", () => {
+    const root = writeWorkspace({ ...validWorkspace, ...elsewhere })
+
+    try {
+      symlinkSync("../../../elsewhere", nodePath.join(root, source, "shared"))
+      const engine = createEngine(root, validConfig)
+      after("lstatSync", root, `${source}/shared`, remove(root, `${source}/shared`))
+      // oxlint hands the plugin the text of a file it reached through the link; the link is gone before it is named.
+      expect(findingsForFile(engine, `${source}/shared/b.ts`, forbidden)).toEqual([])
+    } finally {
+      afterCall.clear()
+      removeWorkspace(root)
+    }
+  })
+
+  it("negative control: a source file that becomes unreadable (EACCES) between listing and reading is still a finding", () => {
+    expect(
+      check({}, {}, validConfig, (root) =>
+        after("readdirSync", root, source, () => {
+          denied.add(nodePath.join(root, source, "size.ts"))
+        }),
+      ),
+    ).toEqual([`unreadable-path ${source}/size.ts ${source}/size.ts`])
+  })
+
+  it("negative control: a directory that becomes unreadable (EACCES) between listing its parent and listing it is still a finding", () => {
+    expect(
+      check({ [`${source}/locked/c.ts`]: forbidden }, {}, validConfig, (root) =>
+        after("readdirSync", root, source, () => {
+          denied.add(nodePath.join(root, source, "locked"))
+        }),
+      ),
+    ).toEqual([`unreadable-path ${source}/locked ${source}/locked`])
   })
 })
 
