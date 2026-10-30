@@ -1,6 +1,6 @@
 {
   "name": "ox-dep-lint",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Module dependency graph rules for oxlint: package kinds, outside packages, runtime and test-only modules, undeclared, escaping and computed imports",
   "license": "MIT",
   "author": "Philip B. Krogh",
