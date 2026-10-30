@@ -56,7 +56,13 @@ vi.mock(import("node:fs"), async (importOriginal) => {
   const statSync = instrumented(actual.statSync as (path: string, options?: unknown) => unknown, "statSync") as typeof actual.statSync
   // SAFETY: as above.
   const lstatSync = instrumented(actual.lstatSync as (path: string, options?: unknown) => unknown, "lstatSync") as typeof actual.lstatSync
-  const replaced = { readdirSync, readFileSync, existsSync, statSync, lstatSync }
+  // SAFETY: as above.
+  const readlinkSync = instrumented(
+    actual.readlinkSync as (path: string, options?: unknown) => unknown,
+    "readlinkSync",
+    "readlink",
+  ) as typeof actual.readlinkSync
+  const replaced = { readdirSync, readFileSync, existsSync, statSync, lstatSync, readlinkSync }
 
   return { ...actual, default: { ...actual, ...replaced }, ...replaced }
 })
@@ -455,6 +461,38 @@ describe("paths that disappear while the check runs", () => {
         }),
       ),
     ).toEqual([`unreadable-path ${source}/size.ts ${source}/size.ts`])
+  })
+
+  it("negative control: a member's package.json that becomes unreadable (EACCES) after the glob found it is still invalid-package", () => {
+    expect(
+      check({}, {}, validConfig, (root) =>
+        after("existsSync", root, "tools/quality/package.json", () => {
+          denied.add(nodePath.join(root, "tools/quality/package.json"))
+        }),
+      ),
+    ).toEqual(["invalid-package tools/quality/package.json tools/quality"])
+  })
+
+  it("negative control: a development file that becomes unreadable (EACCES) before shipped code's import of it is judged is still a finding", () => {
+    expect(
+      check(
+        { "apps/web/scripts/helper.ts": "export const helper = 1\n", "apps/web/src/uses.ts": 'export { helper } from "../scripts/helper.ts"\n' },
+        {},
+        validConfig,
+        (root) =>
+          after("statSync", root, "apps/web/scripts/helper.ts", () => {
+            denied.add(nodePath.join(root, "apps/web/scripts/helper.ts"))
+          }),
+      ),
+    ).toEqual(["shipped-imports-development-file apps/web/src/uses.ts ../scripts/helper.ts"])
+  })
+
+  it("negative control: a symbolic link whose destination cannot be read (EACCES) is still a finding", () => {
+    expect(
+      check({ ...elsewhere }, { [`${source}/link`]: "../../../elsewhere" }, validConfig, (root) => {
+        denied.add(nodePath.join(root, source, "link"))
+      }),
+    ).toEqual([`symbolic-link ${source}/link an unreadable destination`])
   })
 
   it("negative control: a directory that becomes unreadable (EACCES) between listing its parent and listing it is still a finding", () => {
