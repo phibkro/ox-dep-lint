@@ -109,7 +109,109 @@ export const graphFindings = (engine: Engine): Finding[] => {
   return findings
 }
 
-/** Cycles between workspace packages through their runtime dependency fields, each reported once. */
+/** A directed graph's strongly connected components, and the cycle routes the search behind them closes. */
+export interface Components {
+  /** Every component, in the order Tarjan's algorithm completes them (a component before any that reaches it). */
+  readonly components: readonly (readonly string[])[]
+  /**
+   * The cycles the depth-first search closes, in the order it closes them: each edge back to a node still on the search
+   * path gives the route from that node down the path and back to it. Each route lies inside one component; a component
+   * with several back edges has several routes.
+   */
+  readonly routes: readonly (readonly string[])[]
+}
+
+interface Frame {
+  readonly name: string
+  /** The index of the next successor to follow. */
+  next: number
+}
+
+/**
+ * Tarjan's strongly connected components, iterative so that a long chain of packages cannot exhaust the stack. The
+ * search starts from `roots` in order and follows each node's `successors` in order, so components and routes are
+ * deterministic.
+ */
+export const stronglyConnectedComponents = (roots: readonly string[], successors: ReadonlyMap<string, readonly string[]>): Components => {
+  const index = new Map<string, number>()
+  const lowLink = new Map<string, number>()
+  const stack: string[] = []
+  const onStack = new Set<string>()
+  // The search path: the frames of the nodes being searched, and where each of their names sits among them.
+  const frames: Frame[] = []
+  const pathPosition = new Map<string, number>()
+  const components: string[][] = []
+  const routes: string[][] = []
+
+  const enter = (name: string) => {
+    const order = index.size
+    index.set(name, order)
+    lowLink.set(name, order)
+    stack.push(name)
+    onStack.add(name)
+    pathPosition.set(name, frames.length)
+    frames.push({ name, next: 0 })
+  }
+
+  for (const root of roots) {
+    if (index.has(root)) {
+      continue
+    }
+
+    enter(root)
+
+    for (let frame = frames.at(-1); frame !== undefined; frame = frames.at(-1)) {
+      const targets = successors.get(frame.name) ?? []
+      const target = targets[frame.next]
+
+      if (target !== undefined) {
+        frame.next += 1
+
+        if (!index.has(target)) {
+          enter(target)
+        } else if (onStack.has(target)) {
+          lowLink.set(frame.name, Math.min(lowLink.get(frame.name) ?? 0, index.get(target) ?? 0))
+          const position = pathPosition.get(target)
+
+          if (position !== undefined) {
+            routes.push([...frames.slice(position).map((onPath) => onPath.name), target])
+          }
+        }
+
+        continue
+      }
+
+      frames.pop()
+      pathPosition.delete(frame.name)
+      const link = lowLink.get(frame.name) ?? 0
+
+      if (link === index.get(frame.name)) {
+        const component: string[] = []
+
+        for (let member = stack.pop(); member !== undefined; member = member === frame.name ? undefined : stack.pop()) {
+          onStack.delete(member)
+          component.push(member)
+        }
+
+        components.push(component)
+      }
+
+      const parent = frames.at(-1)
+
+      if (parent !== undefined) {
+        lowLink.set(parent.name, Math.min(lowLink.get(parent.name) ?? 0, link))
+      }
+    }
+  }
+
+  return { components, routes }
+}
+
+/**
+ * Cycles between workspace packages through their runtime dependency fields. Every route the search closes is a
+ * finding, once per set of packages, starting at the package the search reached first; so a component with several
+ * cycles can have several findings.
+ */
 const packageCycles = (engine: Engine): Finding[] => {
   const { workspace } = engine
   const edges = new Map(
@@ -118,46 +220,24 @@ const packageCycles = (engine: Engine): Finding[] => {
       [...new Set(runtimeFields.flatMap((field) => entry.manifest[field]))].filter((name) => workspace.byName.has(name) && name !== entry.name),
     ]),
   )
-  const state = new Map<string, "visiting" | "done">()
   const findings: Finding[] = []
   const seen = new Set<string>()
 
-  const visit = (name: string, path: readonly string[]) => {
-    if (state.get(name) === "done") {
-      return
+  for (const cycle of stronglyConnectedComponents([...edges.keys()].toSorted(), edges).routes) {
+    const key = cycle.slice(0, -1).toSorted().join(" ")
+
+    if (!seen.has(key)) {
+      seen.add(key)
+      const first = cycle[0] ?? ""
+      findings.push({
+        rule: "package-cycle",
+        file: `${workspace.byName.get(first)?.directory ?? first}/package.json`,
+        line: 1,
+        column: 0,
+        message: `dependency cycle: ${cycle.join(" -> ")}`,
+        target: key,
+      })
     }
-
-    if (state.get(name) === "visiting") {
-      const cycle = [...path.slice(path.indexOf(name)), name]
-      const key = cycle.slice(0, -1).toSorted().join(" ")
-
-      if (!seen.has(key)) {
-        seen.add(key)
-        const first = workspace.byName.get(name)
-        findings.push({
-          rule: "package-cycle",
-          file: `${first?.directory ?? name}/package.json`,
-          line: 1,
-          column: 0,
-          message: `dependency cycle: ${cycle.join(" -> ")}`,
-          target: key,
-        })
-      }
-
-      return
-    }
-
-    state.set(name, "visiting")
-
-    for (const next of edges.get(name) ?? []) {
-      visit(next, [...path, name])
-    }
-
-    state.set(name, "done")
-  }
-
-  for (const name of [...edges.keys()].toSorted()) {
-    visit(name, [])
   }
 
   return findings
