@@ -32,13 +32,18 @@
     "build": "vp pack",
     "check": "vp check --deny-warnings && vp test run",
     "test": "vp test run",
-    "prepack": "vp pack"
+    "prepack": "vp pack",
+    "prepare": "vp config",
+    "changeset": "changeset"
   },
   "dependencies": {
     "oxc-parser": "0.153.0",
     "oxc-resolver": "11.24.2"
   },
   "devDependencies": {
+    "@changesets/cli": "3.0.3",
+    "@commitlint/cli": "21.2.3",
+    "@commitlint/config-conventional": "21.2.3",
     "@types/node": "24.9.1",
     "oxlint": "1.86.0",
     "typescript": "7.0.2",

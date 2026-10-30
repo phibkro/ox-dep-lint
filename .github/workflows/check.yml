@@ -3,6 +3,8 @@ on:
   push:
     branches: [main]
   pull_request:
+    # `edited` too, so a corrected pull request title is checked again.
+    types: [opened, edited, synchronize, reopened]
 permissions:
   contents: read
 jobs:
@@ -22,3 +24,41 @@ jobs:
       # The tarball must carry the built files (0.1.0 went out without them).
       - name: The package holds dist
         run: npm pack --dry-run --json --ignore-scripts | node -e 'const [pack] = JSON.parse(require("fs").readFileSync(0, "utf8")); for (const file of ["dist/cli.mjs", "dist/index.mjs", "dist/plugin.mjs", "dist/index.d.mts"]) { if (!pack.files.some((entry) => entry.path === file)) { console.error(`missing ${file}`); process.exit(1) } }'
+
+  pull-request:
+    # Every pull request carries a changeset and Conventional Commits, so versions and changelogs can be automated.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.4
+      - run: bun install --frozen-lockfile
+      # HEAD is the merge of the pull request into main as it is now: HEAD^1 is main, HEAD^2 the pull request's head
+      # (the event's base.sha can lag behind main after `edited` or `reopened`).
+      # The release pull request (release.yml) consumes changesets instead of adding one.
+      - name: A changeset says how this changes the version (bunx changeset, or bunx changeset --empty)
+        if: ${{ !(github.head_ref == 'changeset-release/main' && github.event.pull_request.head.repo.full_name == github.repository) }}
+        run: |
+          # Only the top level: changesets reads no subdirectories.
+          added=$(git diff --name-only --diff-filter=A HEAD^1 HEAD -- .changeset | grep -E '^\.changeset/[^/]+\.md$' | grep -v '^.changeset/README.md$' || true)
+          if [ -z "$added" ]; then
+            echo "::error::this pull request adds no changeset: run bunx changeset (patch, minor or major) or bunx changeset --empty"
+            exit 1
+          fi
+          echo "$added"
+      - name: The changesets version cleanly (the same commands the release workflow runs)
+        if: ${{ !(github.head_ref == 'changeset-release/main' && github.event.pull_request.head.repo.full_name == github.repository) }}
+        run: |
+          bunx --no-install changeset version
+          bunx --no-install vp fmt CHANGELOG.md package.json
+          git checkout -q -- . && git clean -fdq .changeset
+      - name: Every commit is a Conventional Commit
+        run: bunx --no-install commitlint --from HEAD^1 --to HEAD^2 --verbose
+      - name: The title is a Conventional Commit (it becomes the squashed commit's message)
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: printf '%s\n' "$TITLE" | bunx --no-install commitlint --verbose
