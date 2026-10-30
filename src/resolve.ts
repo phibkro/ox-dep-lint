@@ -2,31 +2,42 @@
  * What a specifier names, resolved the way TypeScript and bundlers do with oxc-resolver (Oxlint's own resolver):
  * `tsconfig.json` `paths`, `package.json` `imports` and `exports`, `.js` for the `.ts` beside it, symbolic links followed.
  * Adapted from `resolveImports.ts` of phibkro/vektorprogrammet-reimagined (same author).
+ *
+ * An outside package is named by where it resolves (the last `node_modules` segment of its path), not by how it is
+ * written, so an alias (`paths`, `#imports`, `npm:`) cannot pass one package off as another.
  */
-import { realpathSync } from "node:fs"
+import { existsSync, readFileSync, realpathSync } from "node:fs"
 import nodePath from "node:path"
 import { ResolverFactory } from "oxc-resolver"
 import type { ResolvedConfig } from "./config.ts"
-import { packageNameOf } from "./workspace.ts"
+import { packageNameOf, packageOfFile } from "./workspace.ts"
 import type { Workspace } from "./workspace.ts"
 
 export type Target =
   /** A runtime module: `node:fs`, `fs`, `bun`, `cloudflare:workers`. */
   | { readonly kind: "runtime"; readonly name: string }
-  /** A workspace package by its name. */
-  | { readonly kind: "workspace"; readonly name: string }
+  /** A bundler's virtual module (`virtual:pwa-register`): nothing on disk to check. */
+  | { readonly kind: "virtual" }
+  /** A workspace package: the one the import resolves into (a `paths` alias may spell another), and the file when found. */
+  | { readonly kind: "workspace"; readonly name: string; readonly file?: string }
   /** A name under a workspace scope that no package has. */
   | { readonly kind: "unknown-workspace"; readonly name: string }
+  /** A package specifier with `.` or `..` segments after the name (`@acme/a/../b/src/x.ts`). */
+  | { readonly kind: "dotted"; readonly name: string }
   /** A file of the repository, by a relative path or an alias; repository-relative. */
   | { readonly kind: "file"; readonly path: string }
-  /** A relative path that reaches a file outside the repository (absolute path). */
-  | { readonly kind: "outside"; readonly path: string }
+  /** A relative path that reaches a file outside the repository, or into a `node_modules` directory. */
+  | { readonly kind: "outside"; readonly where: string }
   /** A relative path or alias that names no file of the repository. */
   | { readonly kind: "unresolved" }
-  /** An installed package. */
-  | { readonly kind: "external"; readonly name: string }
+  /** An installed package: `name` is where it resolves, `written` how the import names it. */
+  | { readonly kind: "external"; readonly name: string; readonly written: string }
 
-export type Resolve = (importer: string, specifier: string) => Target
+export interface Resolver {
+  readonly resolve: (importer: string, specifier: string) => Target
+  /** Forgets what the file system looked like (an editor session after files were added). */
+  readonly clear: () => void
+}
 
 const aliasPrefixes = ["#", "@/", "~/"]
 
@@ -35,9 +46,59 @@ const isRelative = (specifier: string) => specifier === "." || specifier === "..
 export const isRuntimeModule = (config: ResolvedConfig, specifier: string): boolean =>
   config.runtimePrefixes.some((prefix) => specifier.startsWith(prefix)) || config.runtimeNames.has(packageNameOf(specifier))
 
-/** A resolver for files of `workspace`; `importer` is repository-relative. */
-export const makeResolver = (workspace: Workspace, config: ResolvedConfig): Resolve => {
+/** The package a path inside `node_modules` belongs to: the name after its last `node_modules` segment. */
+const installedName = (path: string): string | undefined => {
+  const parts = path.split(nodePath.sep)
+  const index = parts.lastIndexOf("node_modules")
+
+  if (index === -1) {
+    return undefined
+  }
+
+  const first = parts[index + 1]
+
+  return first?.startsWith("@") === true ? `${first}/${parts[index + 2] ?? ""}` : first
+}
+
+const packageNames = new Map<string, string | undefined>()
+
+/**
+ * The real name of the installed package a path belongs to: the `name` in the package.json at its root (after its last
+ * `node_modules` segment), so an `npm:` alias (`"valibot": "npm:fast-check"`) is judged as the package it installs.
+ */
+const installedPackageName = (path: string): string | undefined => {
+  const parts = path.split(nodePath.sep)
+  const index = parts.lastIndexOf("node_modules")
+  const directoryName = installedName(path)
+
+  if (index === -1 || directoryName === undefined) {
+    return undefined
+  }
+
+  const directory = [...parts.slice(0, index + 1), ...directoryName.split("/")].join(nodePath.sep)
+
+  if (!packageNames.has(directory)) {
+    let name: string | undefined
+
+    try {
+      const manifest: unknown = JSON.parse(readFileSync(nodePath.join(directory, "package.json"), "utf8"))
+      name = typeof manifest === "object" && manifest !== null && "name" in manifest && typeof manifest.name === "string" ? manifest.name : undefined
+    } catch {
+      name = undefined
+    }
+
+    packageNames.set(directory, name ?? directoryName)
+  }
+
+  return packageNames.get(directory)
+}
+
+/** Strips a query (`?raw`) and a fragment, never a leading `#` (a package import). */
+export const withoutQuery = (specifier: string): string => specifier.charAt(0) + specifier.slice(1).replace(/[?#].*$/u, "")
+
+export const makeResolver = (workspace: Workspace, config: ResolvedConfig): Resolver => {
   const factory = new ResolverFactory({
+    builtinModules: true,
     conditionNames: ["import", "types", "node", "default"],
     extensionAlias: {
       ".cjs": [".cts", ".d.cts", ".cjs"],
@@ -51,26 +112,68 @@ export const makeResolver = (workspace: Workspace, config: ResolvedConfig): Reso
   })
   const realRoot = realpathSync(workspace.root)
 
-  const inside = (absolute: string): string | undefined =>
-    absolute.startsWith(`${realRoot}${nodePath.sep}`) && !absolute.split(nodePath.sep).includes("node_modules")
-      ? absolute
-          .slice(realRoot.length + 1)
-          .split(nodePath.sep)
-          .join("/")
-      : undefined
+  const inside = (absolute: string): string | undefined => {
+    if (!absolute.startsWith(`${realRoot}${nodePath.sep}`)) {
+      return undefined
+    }
 
-  return (importer, written) => {
-    const specifier = written.replace(/\?.*$/u, "")
+    const relative = absolute.slice(realRoot.length + 1).split(nodePath.sep)
+
+    return relative.includes("node_modules") ? undefined : relative.join("/")
+  }
+
+  const resolveFile = (importer: string, specifier: string) => {
+    const first = factory.resolveFileSync(nodePath.join(realRoot, importer), specifier)
+
+    // A cached path to a file deleted since (an editor session) does not count as found.
+    if (first.builtin !== undefined || (first.path !== undefined && existsSync(first.path))) {
+      return first
+    }
+
+    // The resolver caches the file system; a file added since (an editor session) deserves one fresh look.
+    factory.clearCache()
+
+    return factory.resolveFileSync(nodePath.join(realRoot, importer), specifier)
+  }
+
+  const resolve = (importer: string, written: string): Target => {
+    const specifier = withoutQuery(written)
 
     if (isRuntimeModule(config, specifier)) {
       return { kind: "runtime", name: specifier }
     }
 
+    if (config.virtualPrefixes.some((prefix) => specifier.startsWith(prefix))) {
+      return { kind: "virtual" }
+    }
+
     const name = packageNameOf(specifier)
 
-    if (!isRelative(specifier)) {
+    if (!isRelative(specifier) && !specifier.startsWith("/")) {
+      const subpath = specifier.slice(name.length).split("/")
+
+      if (
+        (workspace.byName.has(name) || config.workspaceScopes.some((scope) => specifier.startsWith(scope))) &&
+        subpath.some((part) => part === "." || part === "..")
+      ) {
+        return { kind: "dotted", name }
+      }
+
       if (workspace.byName.has(name)) {
-        return { kind: "workspace", name }
+        // Resolved too: a `paths` alias may send a workspace name somewhere else, and the file decides the edge.
+        const found = resolveFile(importer, specifier).path
+        const file = found === undefined ? undefined : inside(found)
+        const owner = file === undefined ? undefined : packageOfFile(workspace, file)
+
+        if (found !== undefined && file === undefined && found.split(nodePath.sep).includes("node_modules")) {
+          // A paths alias that spells a workspace name but lands in another installed package is that package; an
+          // installed copy of the workspace package itself is still that workspace package.
+          const installed = installedPackageName(found) ?? name
+
+          return installed === name ? { kind: "workspace", name } : { kind: "external", name: installed, written: name }
+        }
+
+        return file === undefined ? { kind: "workspace", name } : { kind: "workspace", name: owner?.name ?? name, file }
       }
 
       if (config.workspaceScopes.some((scope) => specifier.startsWith(scope))) {
@@ -78,23 +181,35 @@ export const makeResolver = (workspace: Workspace, config: ResolvedConfig): Reso
       }
     }
 
-    const { path } = factory.resolveFileSync(nodePath.join(realRoot, importer), specifier)
-    const file = path === undefined ? undefined : inside(path)
+    // A root-absolute path (`/src/x.ts`) is Vite's: relative to the importing package's directory.
+    const request = specifier.startsWith("/") ? nodePath.join(realRoot, packageOfFile(workspace, importer)?.directory ?? "", specifier) : specifier
+    const result = resolveFile(importer, request)
+
+    if (result.builtin !== undefined) {
+      return { kind: "runtime", name: result.builtin.resolved }
+    }
+
+    const file = result.path === undefined ? undefined : inside(result.path)
 
     if (file !== undefined) {
       return { kind: "file", path: file }
     }
 
-    if (isRelative(specifier)) {
-      // A relative path that reaches a file outside the repository leaves every package; one that names nothing is unresolved.
-      return path === undefined ? { kind: "unresolved" } : { kind: "outside", path }
+    if (isRelative(specifier) || specifier.startsWith("/")) {
+      if (result.path === undefined) {
+        return existsSync(request) && specifier.startsWith("/") ? { kind: "file", path: nodePath.relative(realRoot, request) } : { kind: "unresolved" }
+      }
+
+      return { kind: "outside", where: result.path.startsWith(`${realRoot}${nodePath.sep}`) ? "into a node_modules directory" : "outside the repository" }
     }
 
-    // An alias (`#x`, `@/x`, `~/x`) that names no file fails closed rather than passing as a package.
-    if (path === undefined && aliasPrefixes.some((prefix) => specifier.startsWith(prefix))) {
-      return { kind: "unresolved" }
+    if (result.path === undefined) {
+      // An alias that names no file fails closed rather than passing as a package.
+      return aliasPrefixes.some((prefix) => specifier.startsWith(prefix)) ? { kind: "unresolved" } : { kind: "external", name, written: name }
     }
 
-    return { kind: "external", name }
+    return { kind: "external", name: installedPackageName(result.path) ?? name, written: name }
   }
+
+  return { resolve, clear: () => factory.clearCache() }
 }
