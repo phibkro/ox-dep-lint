@@ -39,7 +39,9 @@ jobs:
       - run: bun install --frozen-lockfile
       # HEAD is the merge of the pull request into main as it is now: HEAD^1 is main, HEAD^2 the pull request's head
       # (the event's base.sha can lag behind main after `edited` or `reopened`).
+      # The release pull request (release.yml) consumes changesets instead of adding one.
       - name: A changeset says how this changes the version (bunx changeset, or bunx changeset --empty)
+        if: ${{ !(github.head_ref == 'changeset-release/main' && github.event.pull_request.head.repo.full_name == github.repository) }}
         run: |
           # Only the top level: changesets reads no subdirectories.
           added=$(git diff --name-only --diff-filter=A HEAD^1 HEAD -- .changeset | grep -E '^\.changeset/[^/]+\.md$' | grep -v '^.changeset/README.md$' || true)
@@ -48,7 +50,8 @@ jobs:
             exit 1
           fi
           echo "$added"
-      - name: The changesets version cleanly (the same commands the version workflow runs on main)
+      - name: The changesets version cleanly (the same commands the release workflow runs)
+        if: ${{ !(github.head_ref == 'changeset-release/main' && github.event.pull_request.head.repo.full_name == github.repository) }}
         run: |
           bunx --no-install changeset version
           bunx --no-install vp fmt CHANGELOG.md package.json

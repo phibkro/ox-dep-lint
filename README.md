@@ -131,7 +131,7 @@ Where they can still differ: oxlint chooses which files it lints (its own ignore
 
 - Commits and pull request titles follow [Conventional Commits](https://www.conventionalcommits.org/) (`fix:`, `feat:`, `chore:`); a `commit-msg` hook and CI check them with commitlint.
 - Every pull request adds a changeset: `bunx changeset` and pick patch, minor or major, or `bunx changeset --empty` when nothing ships. Before 1.0, a breaking change is a minor bump.
-- Versions follow [semantic versioning](https://semver.org/) and are never edited by hand. When changesets land on main, the `version` workflow bumps `package.json`, writes `CHANGELOG.md`, commits `chore(release): vX.Y.Z` and tags it; the tag publishes to npm with provenance. Empty changesets alone are consumed without a release.
+- Versions follow [semantic versioning](https://semver.org/) and are never edited by hand. While changesets wait on main, the `release` workflow keeps a pull request `chore(release): vX.Y.Z` up to date with the bumped `package.json` and the new `CHANGELOG.md` entry. Merging it publishes that version to npm through trusted publishing (with provenance), tags it and makes a GitHub release. Empty changesets alone open no release; they are consumed with the next one.
 
 ## Licence
 

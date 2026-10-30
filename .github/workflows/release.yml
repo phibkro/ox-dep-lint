@@ -1,23 +1,141 @@
-# Publishes to npm when a version tag is pushed, through npm trusted publishing (OIDC, `id-token: write`): npmjs.com
-# trusts repository phibkro/ox-dep-lint, workflow release.yml, environment release. No token is passed, so a
-# misconfigured trusted publisher fails the job instead of falling back to a stored token. The `release` environment
-# admits only `v*` tags.
+# Releases by semantic versioning from the changesets merged to main, with no stored secret:
+#   1. while changesets wait in .changeset/, `changeset version` runs on a copy of main and its result (package.json
+#      bumped by the largest bump the changesets declare, CHANGELOG.md written from them) is kept up to date as the
+#      pull request "chore(release): vX.Y.Z" from branch changeset-release/main;
+#   2. merging that pull request leaves main at a version npm does not have yet, so the next run checks, builds and
+#      publishes it through npm trusted publishing (OIDC, `id-token: write`), then tags vX.Y.Z and makes a GitHub
+#      release from its changelog entry.
+# npmjs.com trusts repository phibkro/ox-dep-lint, workflow release.yml (this file's name), environment release, which
+# admits only main. No npm token is passed, so a misconfigured trusted publisher fails instead of falling back to one.
+# Only empty changesets waiting: nothing ships, so no pull request; they are consumed with the next release.
+# The workflow's own token opens the pull request, so its checks wait for "Approve workflows to run".
 name: release
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
+  # A rerun after a failed publish or tag; it repeats only what is missing.
+  workflow_dispatch:
 permissions:
   contents: read
-  id-token: write
 concurrency:
   group: release
   cancel-in-progress: false
 jobs:
-  publish:
+  plan:
     runs-on: ubuntu-latest
-    environment: release
+    outputs:
+      pending: ${{ steps.plan.outputs.pending }}
+      publish: ${{ steps.plan.outputs.publish }}
+      tag: ${{ steps.plan.outputs.tag }}
+      version: ${{ steps.plan.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Decide what is missing
+        id: plan
+        run: |
+          version=$(node -p 'require("./package.json").version')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # changesets reads only the top level of .changeset/.
+          if [ -n "$(find .changeset -maxdepth 1 -name '*.md' ! -name README.md -print -quit)" ]; then
+            echo "pending=true" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -z "$(npm view "ox-dep-lint@$version" version 2>/dev/null)" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+          if ! git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+            echo "tag=true" >> "$GITHUB_OUTPUT"
+          fi
+          cat "$GITHUB_OUTPUT"
+
+  release-pull-request:
+    needs: [plan]
+    if: needs.plan.outputs.pending == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.4
+      - run: bun install --frozen-lockfile
+      - name: Version and write the changelog
+        id: bump
+        run: |
+          before=$(node -p 'require("./package.json").version')
+          bunx --no-install changeset version
+          bunx --no-install vp fmt CHANGELOG.md package.json
+          after=$(node -p 'require("./package.json").version')
+          if [ "$before" != "$after" ]; then
+            echo "version=$after" >> "$GITHUB_OUTPUT"
+            # The new changelog entry: from its heading to the next one.
+            awk -v heading="## $after" '$0 == heading { found = 1; next } found && /^## / { exit } found' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          else
+            echo "Only empty changesets wait; nothing ships, so there is no release pull request."
+          fi
+      - name: Open or update the release pull request
+        if: steps.bump.outputs.version != ''
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -q -C changeset-release/main
+          # Only what changeset version writes.
+          git add -A -- package.json CHANGELOG.md .changeset
+          git commit -q -m "chore(release): v$VERSION" -m "Version and changelog from the changesets merged since the last release."
+          # The token is used only here, for this push, and no hooks run.
+          git -c core.hooksPath=/dev/null \
+            -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)" \
+            push --no-verify --force "https://github.com/$REPOSITORY.git" HEAD:refs/heads/changeset-release/main
+          {
+            echo "Merging this releases **ox-dep-lint $VERSION**: the release workflow publishes it to npm with provenance, tags \`v$VERSION\` and makes a GitHub release."
+            echo
+            echo "This pull request is rewritten whenever more changesets reach main. Its checks wait for **Approve workflows to run**, because the workflow's own token opened it."
+            echo
+            echo "## Changelog"
+            echo
+            cat "$RUNNER_TEMP/notes.md"
+          } > "$RUNNER_TEMP/body.md"
+          owner=${REPOSITORY%%/*}
+          number=$(gh api "repos/$REPOSITORY/pulls?head=$owner:changeset-release/main&state=open" --jq '.[0].number // empty')
+          if [ -n "$number" ]; then
+            gh api -X PATCH "repos/$REPOSITORY/pulls/$number" -f title="chore(release): v$VERSION" -F body=@"$RUNNER_TEMP/body.md" --jq .html_url
+          else
+            gh api "repos/$REPOSITORY/pulls" -f base=main -f head=changeset-release/main -f title="chore(release): v$VERSION" -F body=@"$RUNNER_TEMP/body.md" --jq .html_url
+          fi
+
+  publish:
+    needs: [plan]
+    if: needs.plan.outputs.publish == 'true' || needs.plan.outputs.tag == 'true'
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Main still holds the planned version
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: test "$(node -p 'require("./package.json").version')" = "$VERSION"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: 1.4.4
@@ -28,9 +146,23 @@ jobs:
       # Trusted publishing needs npm 11.5.1 or later.
       - run: npm install --global npm@11.21.0
       - run: bun install --frozen-lockfile
-      - name: The tag names the version in package.json
-        run: test "v$(node -p 'require("./package.json").version')" = "$GITHUB_REF_NAME"
       - run: bun run check
       - run: bun run build
       # A prerelease (0.2.0-beta.1) goes to the `next` dist-tag, so `latest` only ever names a release.
-      - run: npm publish --provenance --access public --tag "$(case "$GITHUB_REF_NAME" in *-*) echo next ;; *) echo latest ;; esac)"
+      - name: Publish to npm
+        if: needs.plan.outputs.publish == 'true'
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: npm publish --provenance --access public --tag "$(case "$VERSION" in *-*) echo next ;; *) echo latest ;; esac)"
+      - name: Tag the release and make a GitHub release
+        if: needs.plan.outputs.tag == 'true'
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          awk -v heading="## $VERSION" '$0 == heading { found = 1; next } found && /^## / { exit } found' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          prerelease=$(case "$VERSION" in *-*) echo true ;; *) echo false ;; esac)
+          # The API creates the tag at this commit with the release, so no git credentials are needed.
+          gh api "repos/$REPOSITORY/releases" -f tag_name="v$VERSION" -f target_commitish="$(git rev-parse HEAD)" \
+            -f name="v$VERSION" -F body=@"$RUNNER_TEMP/notes.md" -F prerelease="$prerelease" --jq .html_url
