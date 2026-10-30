@@ -11,7 +11,7 @@ import type { BaselineEntry, Config, FilePolicy, ManifestField, ResolvedConfig, 
 import { matchesAny, matchesGlob } from "./glob.ts"
 import { isRuntimeModule, makeResolver, withoutQuery } from "./resolve.ts"
 import type { Resolver, Target } from "./resolve.ts"
-import { attempt, codeOf } from "./result.ts"
+import { attempt, codeOf, vanished } from "./result.ts"
 import { importForms } from "./specifiers.ts"
 import { loadWorkspace, packageNameOf, packageOfFile } from "./workspace.ts"
 import type { Workspace, WorkspacePackage } from "./workspace.ts"
@@ -271,13 +271,15 @@ export const unreadablePathFinding = (path: string, code: string, kind: "directo
   target: path,
 })
 
-/** The destination a symbolic link names, as written. */
-export const linkDestination = (absolute: string): string => {
-  try {
-    return readlinkSync(absolute)
-  } catch {
-    return "an unreadable destination"
+/** The destination a symbolic link names, as written, or undefined when the link has been removed since it was seen. */
+export const linkDestination = (absolute: string): string | undefined => {
+  const destination = attempt(() => readlinkSync(absolute))
+
+  if (destination.ok) {
+    return destination.value
   }
+
+  return vanished(destination.error) ? undefined : "an unreadable destination"
 }
 
 /**
@@ -358,6 +360,11 @@ export const developmentFileBreaks = (engine: Engine, file: string): string | un
     const reached: string[] = []
     const text = attempt(() => readFileSync(absolute, "utf8"))
 
+    // Removed since it was found: it can break nothing.
+    if (!text.ok && vanished(text.error)) {
+      continue
+    }
+
     if (!text.ok) {
       breaks = `${next} cannot be read (${codeOf(text.error)}), so it cannot be judged`
       break
@@ -397,7 +404,10 @@ export const findingsForFile = (engine: Engine, file: string, text: string, opti
   const link = linkOnPath(engine, owner, file)
 
   if (link !== undefined) {
-    return reportsLink(engine, link) ? [symbolicLinkFinding(link, linkDestination(nodePath.join(workspace.root, link)))] : []
+    // A link removed since it was seen leaves nothing to report and nothing to read.
+    const destination = reportsLink(engine, link) ? linkDestination(nodePath.join(workspace.root, link)) : undefined
+
+    return destination === undefined ? [] : [symbolicLinkFinding(link, destination)]
   }
 
   if (!reads(engine, file) && developmentImports === undefined) {

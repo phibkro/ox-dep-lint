@@ -17,6 +17,17 @@ export const attempt = <Value>(operation: () => Value): Result<Value, unknown> =
 /** The message of something thrown, which need not be an Error. */
 export const messageOf = (cause: unknown): string => (cause instanceof Error ? cause.message : String(cause))
 
+/**
+ * Whether something thrown by `node:fs` says the path is no longer there: `ENOENT`, or `ENOTDIR` when a directory on the
+ * way was replaced by a file. A path removed between being listed and being read (a test's temporary tree, an editor's
+ * swap file) fails this way, and is skipped rather than reported as unreadable.
+ */
+export const vanished = (cause: unknown): boolean => {
+  const code = codeOf(cause)
+
+  return code === "ENOENT" || code === "ENOTDIR"
+}
+
 /** The error code of something thrown by `node:fs` (`EACCES`), or its message when it has none. */
 export const codeOf = (cause: unknown): string =>
   typeof cause === "object" && cause !== null && "code" in cause && typeof cause.code === "string" ? cause.code : messageOf(cause)

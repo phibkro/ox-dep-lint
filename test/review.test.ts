@@ -167,10 +167,75 @@ describe("workspace and configuration robustness (review findings 10, 16 and 18)
     ])
   })
 
-  it("ignores a dependencies field written as a list", () => {
-    expect(
-      findingsWith({ "apps/web/package.json": { name: "@acme/web", dependencies: { "@acme/parcel": "workspace:*" }, devDependencies: ["oops"] } }),
-    ).toEqual([])
+  const dependencyFields = ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"] as const
+
+  it("reports a dependency field that is not an object, in each of the four fields", () => {
+    for (const field of dependencyFields) {
+      for (const value of ["some string", ["oops"], 1, true, null]) {
+        expect(findingsWith({ "tools/extra/package.json": { name: "@acme/extra", [field]: value } }), `${field}: ${JSON.stringify(value)}`).toEqual([
+          `invalid-package tools/extra#${field}`,
+        ])
+      }
+    }
+  })
+
+  it("still checks a member whose dependency field is not an object, as declaring nothing in that field", () => {
+    expect(findingsWith({ "apps/web/package.json": { name: "@acme/web", dependencies: "@acme/parcel" } })).toEqual([
+      "invalid-package apps/web#dependencies",
+      "undeclared-import @acme/parcel",
+    ])
+  })
+
+  it("says which field is wrong and what it holds, once per field", () => {
+    const root = writeWorkspace({ ...validWorkspace, "tools/extra/package.json": { name: "@acme/extra", dependencies: "some string", peerDependencies: [] } })
+
+    try {
+      expect(checkWorkspace(root, validConfig).findings.map((finding) => `${finding.file}: ${finding.message}`)).toEqual([
+        "tools/extra/package.json: dependencies is a string, not an object of package names to version ranges, so no dependency in it is read",
+        "tools/extra/package.json: peerDependencies is a list, not an object of package names to version ranges, so no dependency in it is read",
+      ])
+    } finally {
+      removeWorkspace(root)
+    }
+  })
+
+  it("baselines a field by its own target, so the entry cannot hide a later unreadable or nameless package.json", () => {
+    const quality = validWorkspace["tools/quality/package.json"] as object
+    const root = writeWorkspace({ ...validWorkspace, "tools/quality/package.json": { ...quality, peerDependencies: [] } })
+    const config: Config = {
+      ...validConfig,
+      baseline: [{ file: "tools/quality/package.json", rule: "invalid-package", target: "tools/quality#peerDependencies", reason: "fixed upstream" }],
+    }
+    const findings = () => checkWorkspace(root, config).findings.map((finding) => `${finding.rule} ${finding.file} ${finding.target ?? ""}`)
+
+    try {
+      expect(findings()).toEqual([])
+      writeFileSync(nodePath.join(root, "tools/quality/package.json"), '{ "name": "@acme/tool-quality", ')
+      expect(findings()).toEqual(["invalid-package tools/quality/package.json tools/quality", "stale-baseline tools/quality/package.json invalid-package"])
+      writeFileSync(nodePath.join(root, "tools/quality/package.json"), JSON.stringify({ peerDependencies: [] }))
+      expect(findings()).toEqual(["invalid-package tools/quality/package.json tools/quality", "stale-baseline tools/quality/package.json invalid-package"])
+    } finally {
+      removeWorkspace(root)
+    }
+  })
+
+  it("negative control: an entry for the member's directory does not cover a field's finding", () => {
+    const config: Config = {
+      ...validConfig,
+      baseline: [{ file: "tools/extra/package.json", rule: "invalid-package", target: "tools/extra", reason: "the whole member" }],
+    }
+    expect(findingsWith({ "tools/extra/package.json": { name: "@acme/extra", dependencies: "some string" } }, config)).toEqual([
+      "invalid-package tools/extra#dependencies",
+      "stale-baseline invalid-package",
+    ])
+  })
+
+  it("negative control: dependency fields that are objects, empty or absent, are no finding", () => {
+    for (const field of dependencyFields) {
+      expect(findingsWith({ "tools/extra/package.json": { name: "@acme/extra", [field]: {} } }), field).toEqual([])
+    }
+
+    expect(findingsWith({ "tools/extra/package.json": { name: "@acme/extra" } })).toEqual([])
   })
 
   it("refuses misspelled keys and policies, and a baseline entry without a target", () => {

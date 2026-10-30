@@ -4,9 +4,10 @@
  */
 import { existsSync, lstatSync, readdirSync, readFileSync, statSync } from "node:fs"
 import nodePath from "node:path"
+import { allManifestFields } from "./config.ts"
 import type { ManifestField } from "./config.ts"
 import { matchesGlob } from "./glob.ts"
-import { attempt, codeOf, failure, messageOf, success } from "./result.ts"
+import { attempt, codeOf, failure, messageOf, success, vanished } from "./result.ts"
 import type { Result } from "./result.ts"
 
 export interface WorkspacePackage {
@@ -25,8 +26,12 @@ export interface Workspace {
   readonly byName: ReadonlyMap<string, WorkspacePackage>
   /** The root package's own dependency fields. */
   readonly rootManifest: Readonly<Record<ManifestField, readonly string[]>>
-  /** Members that cannot be checked: no name, a name another member has, an unreadable package.json. */
-  readonly problems: readonly { readonly directory: string; readonly message: string }[]
+  /**
+   * Members whose package.json is wrong. With no name, a name another member has, or a package.json that cannot be read,
+   * the member cannot be checked and is not in `packages`; with a dependency field that is not an object, it is, as if
+   * that field declared nothing, and `field` names it.
+   */
+  readonly problems: readonly { readonly directory: string; readonly message: string; readonly field?: ManifestField }[]
   /** The root package.json's `workspaces` globs, negations (`!apps/old`) included. */
   readonly globs: readonly string[]
 }
@@ -40,23 +45,51 @@ interface Manifest {
   readonly peerDependencies?: unknown
 }
 
+/** Why a manifest cannot be read, and whether that is because it is no longer there (removed since it was found). */
+interface ManifestFailure {
+  readonly message: string
+  readonly vanished: boolean
+}
+
 /** The manifest at `path`, or why it cannot be read. */
-const readManifest = (path: string): Result<Manifest, string> => {
-  const parsed = attempt((): unknown => JSON.parse(readFileSync(path, "utf8")))
+const readManifest = (path: string): Result<Manifest, ManifestFailure> => {
+  const text = attempt(() => readFileSync(path, "utf8"))
+
+  if (!text.ok) {
+    return failure({ message: `${path}: ${messageOf(text.error)}`, vanished: vanished(text.error) })
+  }
+
+  const parsed = attempt((): unknown => JSON.parse(text.value))
 
   if (!parsed.ok) {
-    return failure(`${path}: ${messageOf(parsed.error)}`)
+    return failure({ message: `${path}: ${messageOf(parsed.error)}`, vanished: false })
   }
 
   if (typeof parsed.value !== "object" || parsed.value === null) {
-    return failure(`${path} is not a JSON object`)
+    return failure({ message: `${path} is not a JSON object`, vanished: false })
   }
 
   return success(parsed.value)
 }
 
-const namesOf = (field: unknown): readonly string[] =>
-  typeof field === "object" && field !== null && !Array.isArray(field) ? Object.keys(field).toSorted() : []
+/** Whether a dependency field has the shape npm and Bun require: an object of package names to version ranges. */
+const isRecord = (field: unknown): field is object => typeof field === "object" && field !== null && !Array.isArray(field)
+
+const namesOf = (field: unknown): readonly string[] => (isRecord(field) ? Object.keys(field).toSorted() : [])
+
+/**
+ * A message for each dependency field of `manifest` that is present and not an object (`"dependencies": "x"`, a list, a
+ * number, null). Such a field declares nothing the check can read, so without a finding its edges would pass unseen.
+ */
+const malformedFields = (manifest: Manifest): { readonly field: ManifestField; readonly message: string }[] =>
+  allManifestFields
+    .filter((field) => manifest[field] !== undefined && !isRecord(manifest[field]))
+    .map((field) => {
+      const value = manifest[field]
+      const described = value === null ? "null" : Array.isArray(value) ? "a list" : `a ${typeof value}`
+
+      return { field, message: `${field} is ${described}, not an object of package names to version ranges, so no dependency in it is read` }
+    })
 
 const fieldsOf = (manifest: Manifest): Record<ManifestField, readonly string[]> => ({
   dependencies: namesOf(manifest.dependencies),
@@ -70,7 +103,7 @@ const aliasesOf = (manifest: Manifest): Map<string, string> => {
   const aliases = new Map<string, string>()
 
   for (const field of [manifest.dependencies, manifest.devDependencies, manifest.optionalDependencies, manifest.peerDependencies]) {
-    if (typeof field === "object" && field !== null && !Array.isArray(field)) {
+    if (isRecord(field)) {
       for (const [name, spec] of Object.entries(field)) {
         const target = typeof spec === "string" ? /^npm:(?<target>@?[^@]+)/u.exec(spec)?.groups?.target : undefined
 
@@ -204,7 +237,10 @@ export const directoriesMatching = (root: string, pattern: string, unlisted?: Un
     const listed = attempt(() => readdirSync(nodePath.join(root, relative), { withFileTypes: true }))
 
     if (!listed.ok) {
-      unlisted?.unreadable.push({ directory: relative, code: codeOf(listed.error) })
+      // Removed (or replaced by a file) since it was found: nothing is left to list or report.
+      if (!vanished(listed.error)) {
+        unlisted?.unreadable.push({ directory: relative, code: codeOf(listed.error) })
+      }
 
       return
     }
@@ -234,7 +270,10 @@ export const directoriesMatching = (root: string, pattern: string, unlisted?: Un
     return existsSync(nodePath.join(root, base)) ? [base] : []
   }
 
-  if (existsSync(nodePath.join(root, base)) && statSync(nodePath.join(root, base)).isDirectory()) {
+  // One look rather than `existsSync` then `statSync`, so a base removed in between is no error.
+  const status = attempt(() => statSync(nodePath.join(root, base)))
+
+  if (status.ok && status.value.isDirectory()) {
     walk(base, base === "" ? 0 : base.split("/").length)
   }
 
@@ -245,7 +284,7 @@ export const loadWorkspace = (root: string): Workspace => {
   const rootRead = readManifest(nodePath.join(root, "package.json"))
 
   if (!rootRead.ok) {
-    throw new Error(rootRead.error)
+    throw new Error(rootRead.error.message)
   }
 
   const rootManifest = rootRead.value
@@ -269,14 +308,19 @@ export const loadWorkspace = (root: string): Workspace => {
   }
 
   const packages: WorkspacePackage[] = []
-  const problems: { directory: string; message: string }[] = []
+  const problems: { directory: string; message: string; field?: ManifestField }[] = []
   const byName = new Map<string, WorkspacePackage>()
 
   for (const directory of [...directories].toSorted()) {
     const read = readManifest(nodePath.join(root, directory, "package.json"))
 
+    // A member removed since the glob found it is no member; one whose package.json cannot be read for another reason is a finding.
+    if (!read.ok && read.error.vanished) {
+      continue
+    }
+
     if (!read.ok) {
-      problems.push({ directory, message: `package.json cannot be read: ${read.error}` })
+      problems.push({ directory, message: `package.json cannot be read: ${read.error.message}` })
       continue
     }
 
@@ -292,6 +336,10 @@ export const loadWorkspace = (root: string): Workspace => {
     if (other !== undefined) {
       problems.push({ directory, message: `${manifest.name} is also the name of ${other.directory}` })
       continue
+    }
+
+    for (const { field, message } of malformedFields(manifest)) {
+      problems.push({ directory, message, field })
     }
 
     const entry = { name: manifest.name, directory, manifest: fieldsOf(manifest), aliases: aliasesOf(manifest) }

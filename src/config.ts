@@ -168,7 +168,7 @@ export const defaultOutput: readonly string[] = [
   ".output/**",
 ]
 
-const allManifestFields: readonly ManifestField[] = ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"]
+export const allManifestFields: readonly ManifestField[] = ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"]
 
 /** Identity, for type checking a configuration file. */
 export const defineConfig = (config: Config): Config => config

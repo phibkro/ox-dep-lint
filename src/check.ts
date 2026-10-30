@@ -17,7 +17,7 @@ import {
 } from "./engine.ts"
 import type { Engine, Finding } from "./engine.ts"
 import { graphFindings, staleBaseline } from "./graph.ts"
-import { attempt, codeOf } from "./result.ts"
+import { attempt, codeOf, vanished } from "./result.ts"
 
 /** The source files of the workspace's packages, and what kept the walk from seeing all of them. */
 export interface SourceWalk {
@@ -31,7 +31,7 @@ export interface SourceWalk {
  * other dot directories hold sources too). A walk rather than `git ls-files`: generated and gitignored sources still
  * ship, and a nested repository or submodule inside a package is still part of it. A symbolic link is never followed:
  * every one is a finding, whatever it points at, unless it lies in a directory the check skips on purpose; and so is a
- * directory the walk cannot list.
+ * directory the walk cannot list. A path removed between being listed and being read is skipped, with no finding.
  */
 export const walkSources = (engine: Engine): SourceWalk => {
   const files = new Set<string>()
@@ -44,7 +44,8 @@ export const walkSources = (engine: Engine): SourceWalk => {
     try {
       entries = readdirSync(nodePath.join(root, relative), { withFileTypes: true })
     } catch (cause) {
-      if (!skipsDirectory(engine, relative)) {
+      // Removed (or replaced by a file) since its parent was listed: nothing is there to check.
+      if (!vanished(cause) && !skipsDirectory(engine, relative)) {
         findings.set(relative, unreadablePathFinding(relative, codeOf(cause)))
       }
 
@@ -59,8 +60,10 @@ export const walkSources = (engine: Engine): SourceWalk => {
           walk(path)
         }
       } else if (entry.isSymbolicLink()) {
-        if (reportsLink(engine, path)) {
-          findings.set(path, symbolicLinkFinding(path, linkDestination(nodePath.join(root, path))))
+        const destination = reportsLink(engine, path) ? linkDestination(nodePath.join(root, path)) : undefined
+
+        if (destination !== undefined) {
+          findings.set(path, symbolicLinkFinding(path, destination))
         }
       } else if (entry.isFile() && reads(engine, path)) {
         files.add(path)
@@ -86,17 +89,26 @@ export interface CheckResult {
 export const checkWorkspace = (root: string, config: Config): CheckResult => {
   const engine = createEngine(root, config)
   const { files, findings: walked } = walkSources(engine)
+  const perFile: Finding[] = []
+  let checked = 0
+
+  for (const file of files) {
+    const text = attempt(() => readFileSync(nodePath.join(root, file), "utf8"))
+
+    if (text.ok) {
+      checked += 1
+      perFile.push(...findingsForFile(engine, file, text.value))
+    } else if (!vanished(text.error)) {
+      // A file removed since the walk listed it is no file to check; one that cannot be read for another reason is a finding.
+      checked += 1
+      perFile.push(unreadablePathFinding(file, codeOf(text.error), "file"))
+    }
+  }
+
   // A package with no kind is reported once, from its package.json, by the graph checks.
-  const perFile = files
-    .flatMap((file) => {
-      const text = attempt(() => readFileSync(nodePath.join(root, file), "utf8"))
+  const all = [...walked, ...perFile.filter((finding) => finding.rule !== "package-without-kind"), ...graphFindings(engine)]
 
-      return text.ok ? findingsForFile(engine, file, text.value) : [unreadablePathFinding(file, codeOf(text.error), "file")]
-    })
-    .filter((finding) => finding.rule !== "package-without-kind")
-  const all = [...walked, ...perFile, ...graphFindings(engine)]
-
-  return { files: files.length, findings: [...withoutBaselined(engine, all), ...staleBaseline(engine, all)] }
+  return { files: checked, findings: [...withoutBaselined(engine, all), ...staleBaseline(engine, all)] }
 }
 
 export const formatFinding = (finding: Finding): string => `${finding.file}:${finding.line}:${finding.column + 1} ${finding.rule}: ${finding.message}`
