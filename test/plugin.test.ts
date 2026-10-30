@@ -1,6 +1,6 @@
 /** The oxlint rule and the CLI read one engine, so under real oxlint they must report the same per-file findings. */
 import { execFileSync } from "node:child_process"
-import { readFileSync, writeFileSync } from "node:fs"
+import { readFileSync, symlinkSync, writeFileSync } from "node:fs"
 import nodePath from "node:path"
 import { describe, expect, it } from "vite-plus/test"
 import { checkWorkspace } from "../src/check.ts"
@@ -15,6 +15,8 @@ const violations = {
   "services/room/src/index.ts": 'import "@acme/platform-cloudflare"\nexport * from "@acme/service-quota"\nexport const lazy = await import(`./x${1}.ts`)\n',
   "libraries/parcel/src/runtime.ts": 'import { readFileSync } from "fs"\nimport "./missing.ts"\nexport const read = readFileSync\n',
   "apps/web/src/main.ts": 'import "../../../libraries/parcel/src/size.ts"\nimport "fast-check"\n',
+  // A dot directory: both front ends read it.
+  "libraries/parcel/src/.internal/x.ts": 'import "@acme/platform-cloudflare"\n',
 }
 
 const lintedFindings = (root: string): string[] => {
@@ -53,6 +55,43 @@ describe("the oxlint plugin", () => {
 
       expect(cli.length).toBeGreaterThanOrEqual(8)
       expect(lintedFindings(root)).toEqual(cli)
+    } finally {
+      removeWorkspace(root)
+    }
+  }, 30_000)
+})
+
+describe("the plugin and symbolic links", () => {
+  it("reports a file oxlint reaches through a link as the link, and reads nothing behind it", () => {
+    const root = writeWorkspace({
+      ...validWorkspace,
+      "elsewhere/b.ts": 'import "@acme/platform-cloudflare"\nimport { readFileSync } from "node:fs"\nexport const read = readFileSync\n',
+      "elsewhere/vendored/c.ts": 'import "@acme/platform-cloudflare"\n',
+    })
+
+    try {
+      symlinkSync("../../../elsewhere/b.ts", nodePath.join(root, "libraries/parcel/src/linked.ts"))
+      symlinkSync("../../../elsewhere", nodePath.join(root, "libraries/parcel/src/shared"))
+      symlinkSync("../../../elsewhere/vendored", nodePath.join(root, "libraries/parcel/src/vendored"))
+      const config = {
+        ...validConfig,
+        baseline: [{ file: "libraries/parcel/src/vendored", rule: "symbolic-link" as const, target: "../../../elsewhere/vendored", reason: "vendored" }],
+      }
+      writeFileSync(
+        nodePath.join(root, ".oxlintrc.json"),
+        JSON.stringify({ plugins: [], jsPlugins: [plugin], rules: { "dep-lint/imports": ["error", config] } }),
+      )
+
+      // oxlint follows links (the CLI never does), so it lints the files behind the directory link one by one.
+      expect(lintedFindings(root)).toEqual([
+        "libraries/parcel/src/linked.ts:1:1 symbolic-link",
+        "libraries/parcel/src/shared/b.ts:1:1 symbolic-link",
+        "libraries/parcel/src/shared/vendored/c.ts:1:1 symbolic-link",
+      ])
+      expect(checkWorkspace(root, config).findings.map((finding) => `${finding.file} ${finding.rule}`)).toEqual([
+        "libraries/parcel/src/linked.ts symbolic-link",
+        "libraries/parcel/src/shared symbolic-link",
+      ])
     } finally {
       removeWorkspace(root)
     }

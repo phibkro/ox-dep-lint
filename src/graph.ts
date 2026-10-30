@@ -1,14 +1,27 @@
 /**
  * Checks that need the whole workspace rather than one file: edges declared only in `package.json`, cycles between
- * packages, packages no kind holds, and baseline entries no finding needs any more. Only the CLI runs these, because an
- * oxlint plugin sees one file at a time and never sees `package.json`.
+ * packages, packages no kind holds, directories the workspaces match that no package owns, and baseline entries no
+ * finding needs any more. Only the CLI runs these, because an oxlint plugin sees one file at a time and never sees
+ * `package.json`.
  */
-import { existsSync } from "node:fs"
+import { existsSync, readdirSync, statSync } from "node:fs"
 import nodePath from "node:path"
 import type { ManifestField } from "./config.ts"
-import { baselineCovers, edgeRefusal } from "./engine.ts"
+import {
+  baselineCovers,
+  coversDirectory,
+  edgeRefusal,
+  ignoresDirectory,
+  linkDestination,
+  passedOver,
+  symbolicLinkFinding,
+  unreadablePathFinding,
+} from "./engine.ts"
 import type { Engine, Finding } from "./engine.ts"
+import { matchesGlob } from "./glob.ts"
+import { codeOf } from "./result.ts"
 import { directoriesMatching } from "./workspace.ts"
+import type { Unlisted } from "./workspace.ts"
 
 const runtimeFields: readonly ManifestField[] = ["dependencies", "optionalDependencies", "peerDependencies"]
 
@@ -23,10 +36,12 @@ export const graphFindings = (engine: Engine): Finding[] => {
 
   // A directory a kind names, with a package.json, that the workspace leaves out would otherwise go unchecked.
   const members = new Set([...workspace.packages.map((entry) => entry.directory), ...workspace.problems.map((problem) => problem.directory)])
+  // What a kind's globs could not list or follow is reported with what the workspaces globs could not.
+  const unlistedByKinds: Unlisted = { links: [], unreadable: [], dotDirectories: [] }
 
   for (const kind of Object.values(config.kinds)) {
     for (const pattern of kind.packages) {
-      for (const directory of directoriesMatching(workspace.root, pattern)) {
+      for (const directory of directoriesMatching(workspace.root, pattern, unlistedByKinds)) {
         if (!members.has(directory) && existsSync(nodePath.join(workspace.root, directory, "package.json"))) {
           members.add(directory)
           findings.push({
@@ -40,6 +55,8 @@ export const graphFindings = (engine: Engine): Finding[] => {
       }
     }
   }
+
+  findings.push(...directoriesWithoutPackage(engine, members, unlistedByKinds))
 
   for (const entry of workspace.packages) {
     const manifest = `${entry.directory}/package.json`
@@ -107,6 +124,121 @@ export const graphFindings = (engine: Engine): Finding[] => {
   findings.push(...packageCycles(engine))
 
   return findings
+}
+
+const isDirectory = (absolute: string): boolean => {
+  try {
+    return statSync(absolute).isDirectory()
+  } catch {
+    return false
+  }
+}
+
+/** Whether `absolute`, links followed, is something other than a directory; false when nothing is there. */
+const isFile = (absolute: string): boolean => {
+  try {
+    return !statSync(absolute).isDirectory()
+  } catch {
+    return false
+  }
+}
+
+/** The error code of a directory that cannot be listed, or undefined when it can. */
+const unreadable = (absolute: string): string | undefined => {
+  try {
+    readdirSync(absolute)
+
+    return undefined
+  } catch (cause) {
+    return codeOf(cause)
+  }
+}
+
+/**
+ * What the root's `workspaces` globs (and a kind's globs) match that is no package: a directory without a
+ * `package.json`, whose files no package owns and so nothing checks (only the topmost of nested ones); a dot directory,
+ * which no workspaces glob matches; a directory the globs cannot list; and a symbolic link to a directory (or to
+ * nothing), which is never followed. Inside a member the walk reports these, so they are left to it. A directory above a member (under `packages/**`), one a negated glob or `ignore` leaves out, and
+ * anything under `node_modules` or `.git` are not reported.
+ */
+const directoriesWithoutPackage = (engine: Engine, members: ReadonlySet<string>, unlistedByKinds: Unlisted): Finding[] => {
+  const { workspace } = engine
+  const negated = workspace.globs.filter((glob) => glob.startsWith("!")).map((glob) => glob.slice(1).replace(/^\.\//u, "").replace(/\/$/u, ""))
+  const inside = (path: string) => [...members].some((member) => path === member || path.startsWith(`${member}/`))
+  const above = (path: string) => [...members].some((member) => member.startsWith(`${path}/`))
+  const leftOut = (path: string) =>
+    path.split("/").some(passedOver) ||
+    negated.some((pattern) => matchesGlob(path, pattern) || coversDirectory(pattern, path)) ||
+    ignoresDirectory(engine, path)
+  const candidates = new Map<string, string>()
+  const unlisted: Unlisted = { links: [...unlistedByKinds.links], unreadable: [...unlistedByKinds.unreadable], dotDirectories: [] }
+
+  for (const glob of workspace.globs.filter((pattern) => !pattern.startsWith("!"))) {
+    for (const directory of directoriesMatching(workspace.root, glob, unlisted)) {
+      if (!candidates.has(directory)) {
+        candidates.set(directory, glob)
+      }
+    }
+  }
+
+  const withoutPackage = (directory: string, glob: string): Finding | undefined => {
+    if (above(directory) || !isDirectory(nodePath.join(workspace.root, directory))) {
+      return undefined
+    }
+
+    const code = unreadable(nodePath.join(workspace.root, directory))
+
+    return code === undefined
+      ? {
+          rule: "directory-without-package",
+          file: directory,
+          line: 1,
+          column: 0,
+          message: `${directory} matches the workspaces glob ${glob} but has no package.json, so no package owns what it holds and nothing in it is checked: make it a package, remove it, or add ${directory}/** to ignore`,
+          target: directory,
+        }
+      : unreadablePathFinding(directory, code)
+  }
+
+  const dotDirectory = (directory: string): Finding => ({
+    rule: "directory-without-package",
+    file: directory,
+    line: 1,
+    column: 0,
+    message: `${directory} is a dot directory, which workspaces globs never match, so it is no package${existsSync(nodePath.join(workspace.root, directory, "package.json")) ? " though it has a package.json" : ""} and nothing in it is checked: rename it, list it in workspaces by its full path, remove it, or add ${directory}/** to ignore`,
+    target: directory,
+  })
+
+  // Every candidate, shortest path first, so the topmost of nested ones is reported and what lies below it is not.
+  const pending: { readonly path: string; readonly finding: () => Finding | undefined }[] = [
+    ...unlisted.unreadable.map(({ directory, code }) => ({ path: directory, finding: () => unreadablePathFinding(directory, code) })),
+    ...[...candidates].map(([directory, glob]) => ({ path: directory, finding: () => withoutPackage(directory, glob) })),
+    ...unlisted.dotDirectories.map((directory) => ({ path: directory, finding: () => dotDirectory(directory) })),
+    // A link to a file is no package, as a file there is none; a link to a directory, or to nothing, may be one.
+    ...unlisted.links.map((link) => ({
+      path: link,
+      finding: () =>
+        isFile(nodePath.join(workspace.root, link)) ? undefined : symbolicLinkFinding(link, linkDestination(nodePath.join(workspace.root, link))),
+    })),
+  ].toSorted((left, right) => left.path.split("/").length - right.path.split("/").length || left.path.localeCompare(right.path))
+
+  const findings = new Map<string, Finding>()
+
+  for (const { path, finding } of pending) {
+    const reportedAbove = [...findings.keys()].some((reported) => path.startsWith(`${reported}/`))
+
+    if (findings.has(path) || inside(path) || leftOut(path) || reportedAbove) {
+      continue
+    }
+
+    const made = finding()
+
+    if (made !== undefined) {
+      findings.set(path, made)
+    }
+  }
+
+  return [...findings.values()].toSorted((left, right) => left.file.localeCompare(right.file))
 }
 
 /** A directed graph's strongly connected components, and the cycle routes the search behind them closes. */

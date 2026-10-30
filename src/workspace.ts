@@ -2,11 +2,11 @@
  * The workspace as `package.json` files declare it: the root's `workspaces` globs, and each package's real name (never
  * guessed from its directory) and dependency fields.
  */
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs"
+import { existsSync, lstatSync, readdirSync, readFileSync, statSync } from "node:fs"
 import nodePath from "node:path"
 import type { ManifestField } from "./config.ts"
 import { matchesGlob } from "./glob.ts"
-import { attempt, failure, messageOf, success } from "./result.ts"
+import { attempt, codeOf, failure, messageOf, success } from "./result.ts"
 import type { Result } from "./result.ts"
 
 export interface WorkspacePackage {
@@ -27,6 +27,8 @@ export interface Workspace {
   readonly rootManifest: Readonly<Record<ManifestField, readonly string[]>>
   /** Members that cannot be checked: no name, a name another member has, an unreadable package.json. */
   readonly problems: readonly { readonly directory: string; readonly message: string }[]
+  /** The root package.json's `workspaces` globs, negations (`!apps/old`) included. */
+  readonly globs: readonly string[]
 }
 
 interface Manifest {
@@ -144,7 +146,36 @@ export const findWorkspaceRoot = (start: string): string | undefined => {
   }
 }
 
-export const directoriesMatching = (root: string, pattern: string): string[] => {
+/** The first of `path`'s directories (repository-relative), itself included, that is a symbolic link. */
+const linkAlong = (root: string, path: string): string | undefined => {
+  const parts = path === "" ? [] : path.split("/")
+
+  return parts
+    .map((_, index) => parts.slice(0, index + 1).join("/"))
+    .find((prefix) => {
+      const status = attempt(() => lstatSync(nodePath.join(root, prefix)))
+
+      return status.ok && status.value.isSymbolicLink()
+    })
+}
+
+/**
+ * What `directoriesMatching` met and did not descend into: symbolic links the pattern matches or passes through,
+ * directories it could not list, and dot directories it matches (other than `.git`), which workspaces globs never match.
+ */
+export interface Unlisted {
+  readonly links: string[]
+  readonly unreadable: { readonly directory: string; readonly code: string }[]
+  readonly dotDirectories: string[]
+}
+
+/**
+ * The directories under `root` that `pattern` matches, skipping `node_modules` and dot directories, as npm and Bun
+ * workspaces do. A symbolic link is never followed, not even one the pattern names literally or passes through (a
+ * `packages` that is a link), and a directory that cannot be listed is passed over; with `unlisted`, those and the dot
+ * directories the pattern would match are collected there, so the caller can report them.
+ */
+export const directoriesMatching = (root: string, pattern: string, unlisted?: Unlisted): string[] => {
   const negated = pattern.startsWith("!")
   const clean = (negated ? pattern.slice(1) : pattern).replace(/^\.\//u, "").replace(/\/$/u, "")
   const fixed: string[] = []
@@ -170,13 +201,33 @@ export const directoriesMatching = (root: string, pattern: string): string[] => 
       return
     }
 
-    const absolute = nodePath.join(root, relative)
+    const listed = attempt(() => readdirSync(nodePath.join(root, relative), { withFileTypes: true }))
 
-    for (const entry of readdirSync(absolute, { withFileTypes: true })) {
+    if (!listed.ok) {
+      unlisted?.unreadable.push({ directory: relative, code: codeOf(listed.error) })
+
+      return
+    }
+
+    for (const entry of listed.value) {
+      const path = relative === "" ? entry.name : `${relative}/${entry.name}`
+
       if (entry.isDirectory() && entry.name !== "node_modules" && !entry.name.startsWith(".")) {
-        walk(relative === "" ? entry.name : `${relative}/${entry.name}`, depth + 1)
+        walk(path, depth + 1)
+      } else if (entry.isDirectory() && entry.name.startsWith(".") && entry.name !== ".git" && matchesGlob(path, clean)) {
+        unlisted?.dotDirectories.push(path)
+      } else if (entry.isSymbolicLink() && matchesGlob(path, clean)) {
+        unlisted?.links.push(path)
       }
     }
+  }
+
+  const link = linkAlong(root, base)
+
+  if (link !== undefined) {
+    unlisted?.links.push(link)
+
+    return []
   }
 
   if (base === clean) {
@@ -248,7 +299,7 @@ export const loadWorkspace = (root: string): Workspace => {
     byName.set(entry.name, entry)
   }
 
-  return { root, packages, byName, rootManifest: fieldsOf(rootManifest), problems }
+  return { root, packages, byName, rootManifest: fieldsOf(rootManifest), problems, globs }
 }
 
 /** The package whose directory holds the repository-relative `file`, the deepest one when packages nest. */

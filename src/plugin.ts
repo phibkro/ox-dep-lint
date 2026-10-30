@@ -5,7 +5,9 @@
  *   jsPlugins: ["ox-dep-lint/plugin"],
  *   rules: { "dep-lint/imports": ["error", depLintConfig] }
  *
- * Whole-graph checks (package.json edges and externals, package cycles, stale baseline entries) need the CLI.
+ * Whole-graph checks (package.json edges and externals, package cycles, directories no package owns, unreadable
+ * directories, stale baseline entries) need the CLI. oxlint follows symbolic links, so a file it reaches through one is
+ * reported as `symbolic-link` and not read further, as the CLI never reads it.
  */
 import { statSync } from "node:fs"
 import nodePath from "node:path"
