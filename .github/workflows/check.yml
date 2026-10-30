@@ -37,21 +37,23 @@ jobs:
         with:
           bun-version: 1.4.4
       - run: bun install --frozen-lockfile
+      # HEAD is the merge of the pull request into main as it is now: HEAD^1 is main, HEAD^2 the pull request's head
+      # (the event's base.sha can lag behind main after `edited` or `reopened`).
       - name: A changeset says how this changes the version (bunx changeset, or bunx changeset --empty)
-        env:
-          BASE: ${{ github.event.pull_request.base.sha }}
         run: |
-          added=$(git diff --name-only --diff-filter=A "$BASE" HEAD -- .changeset | grep -v '^.changeset/README.md$' | grep '\.md$' || true)
+          added=$(git diff --name-only --diff-filter=A HEAD^1 HEAD -- .changeset | grep -v '^.changeset/README.md$' | grep '\.md$' || true)
           if [ -z "$added" ]; then
             echo "::error::this pull request adds no changeset: run bunx changeset (patch, minor or major) or bunx changeset --empty"
             exit 1
           fi
           echo "$added"
+      - name: The changesets version cleanly (what the version workflow runs on main)
+        run: |
+          bunx --no-install changeset version
+          bunx --no-install vp fmt --check CHANGELOG.md package.json
+          git checkout -q -- . && git clean -fdq .changeset
       - name: Every commit is a Conventional Commit
-        env:
-          BASE: ${{ github.event.pull_request.base.sha }}
-          HEAD: ${{ github.event.pull_request.head.sha }}
-        run: bunx --no-install commitlint --from "$BASE" --to "$HEAD" --verbose
+        run: bunx --no-install commitlint --from HEAD^1 --to HEAD^2 --verbose
       - name: The title is a Conventional Commit (it becomes the squashed commit's message)
         env:
           TITLE: ${{ github.event.pull_request.title }}

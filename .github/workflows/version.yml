@@ -3,9 +3,10 @@
 #      package.json by the largest bump they declare (patch, minor, major) and writes CHANGELOG.md from them;
 #   2. that is committed to main as "chore(release): vX.Y.Z" and tagged vX.Y.Z;
 #   3. the push of the tag starts release.yml, which publishes to npm through trusted publishing.
-# The commit and the tag are pushed with a deploy key (secret RELEASE_DEPLOY_KEY of the `version` environment, which
-# only main may use): unlike the workflow's own token, a deploy key's push starts other workflows, and it can be put on
-# a ruleset's bypass list if main requires pull requests. The release commit's own `check` run finds no changesets.
+# The commit and the tag are pushed together (atomically) with a deploy key (secret RELEASE_DEPLOY_KEY of the `version`
+# environment, which only main may use): unlike the workflow's own token, a deploy key's push starts other workflows,
+# and it sits on main's ruleset bypass list. The key is loaded only for the push, never while installed code runs.
+# The release commit's own `check` run finds no changesets.
 # Adapted from file-transfer's release workflow (phibkro/file-transfer, docs/decisions/0023), same author.
 name: version
 on:
@@ -55,7 +56,7 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
-          ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
+          persist-credentials: false
       - name: Check the key and the commit
         id: current
         env:
@@ -96,8 +97,26 @@ jobs:
           if [ -n "$VERSION" ]; then
             git commit -q -m "chore(release): v$VERSION" -m "Version and changelog from the changesets merged since the last release."
             git tag -a "v$VERSION" -m "ox-dep-lint $VERSION"
-            git push origin HEAD:main "v$VERSION"
           else
             git commit -q -m "chore: consume empty changesets" -m "They changed nothing that ships, so there is no release."
-            git push origin HEAD:main
           fi
+      - name: Push the commit and the tag together
+        if: steps.current.outputs.skip != 'true'
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+          KEY: ${{ secrets.RELEASE_DEPLOY_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          # GitHub's SSH host keys from its API (over HTTPS, so authenticated), never trusted on first use.
+          gh api meta --jq '.ssh_keys[] | "github.com " + .' > "$RUNNER_TEMP/known_hosts"
+          install -m 600 /dev/null "$RUNNER_TEMP/deploy_key"
+          printf '%s\n' "$KEY" > "$RUNNER_TEMP/deploy_key"
+          export GIT_SSH_COMMAND="ssh -i $RUNNER_TEMP/deploy_key -o IdentitiesOnly=yes -o UserKnownHostsFile=$RUNNER_TEMP/known_hosts -o StrictHostKeyChecking=yes"
+          # Atomic: if main moved on, neither lands, so no tag (and no npm release) ever names a commit main lacks.
+          if [ -n "$VERSION" ]; then
+            git push --atomic "git@github.com:$REPOSITORY.git" HEAD:main "v$VERSION"
+          else
+            git push "git@github.com:$REPOSITORY.git" HEAD:main
+          fi
+          rm -f "$RUNNER_TEMP/deploy_key"
