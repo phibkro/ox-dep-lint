@@ -12,6 +12,8 @@ import nodePath from "node:path"
 import type { Config } from "./config.ts"
 import { createEngine, findingsForFile, withoutBaselined } from "./engine.ts"
 import type { Engine } from "./engine.ts"
+import { attempt, failure } from "./result.ts"
+import type { Result } from "./result.ts"
 import { findWorkspaceRoot } from "./workspace.ts"
 
 interface RuleContext {
@@ -27,7 +29,7 @@ interface RuleContext {
 }
 
 interface Cached {
-  readonly engine: Engine | Error
+  readonly engine: Result<Engine, Error>
   /** The package.json files the engine read, with their modification times. */
   readonly manifests: ReadonlyMap<string, number>
   checkedAt: number
@@ -47,8 +49,8 @@ const modified = (path: string): number => {
   }
 }
 
-const manifestsOf = (root: string, engine: Engine | Error): Map<string, number> => {
-  const directories = engine instanceof Error ? [] : engine.workspace.packages.map((entry) => nodePath.join(root, entry.directory))
+const manifestsOf = (root: string, engine: Result<Engine, Error>): Map<string, number> => {
+  const directories = engine.ok ? engine.value.workspace.packages.map((entry) => nodePath.join(root, entry.directory)) : []
   // The directories that hold packages too: adding a package there changes their modification time.
   const paths = [
     nodePath.join(root, "package.json"),
@@ -59,16 +61,14 @@ const manifestsOf = (root: string, engine: Engine | Error): Map<string, number> 
   return new Map(paths.map((path) => [path, modified(path)]))
 }
 
-const build = (root: string, config: Config): Engine | Error => {
-  try {
-    return createEngine(root, config)
-  } catch (error) {
-    return error instanceof Error ? error : new Error(String(error))
-  }
+const build = (root: string, config: Config): Result<Engine, Error> => {
+  const built = attempt(() => createEngine(root, config))
+
+  return built.ok ? built : failure(built.error instanceof Error ? built.error : new Error(String(built.error)))
 }
 
 /** The engine for `root` and `config`, rebuilt when a package.json it read has changed. */
-const engineFor = (root: string, config: Config): Engine | Error => {
+const engineFor = (root: string, config: Config): Result<Engine, Error> => {
   const key = `${root}\0${JSON.stringify(config)}`
   const now = Date.now()
   const cached = cache.get(key)
@@ -127,13 +127,15 @@ const imports = {
           return
         }
 
-        const engine = engineFor(root, config)
+        const built = engineFor(root, config)
 
-        if (engine instanceof Error) {
-          context.report({ message: engine.message, loc: { start } })
+        if (!built.ok) {
+          context.report({ message: built.error.message, loc: { start } })
 
           return
         }
+
+        const engine = built.value
 
         const file = nodePath.relative(root, context.filename).split(nodePath.sep).join("/")
 

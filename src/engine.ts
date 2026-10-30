@@ -184,11 +184,14 @@ export const developmentFileBreaks = (engine: Engine, file: string): string | un
   }
 
   const read = new Map<string, number>()
+  // A queue read from a head index: `shift()` copies the rest of the array, which made long chains quadratic.
   const queue = [file]
+  let head = 0
   let breaks: string | undefined
 
-  while (queue.length > 0 && breaks === undefined) {
-    const next = queue.shift() ?? file
+  while (head < queue.length && breaks === undefined) {
+    const next = queue[head] ?? file
+    head += 1
     const absolute = nodePath.join(engine.workspace.root, next)
     const time = modifiedTime(absolute)
 

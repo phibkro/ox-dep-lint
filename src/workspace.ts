@@ -6,6 +6,8 @@ import { existsSync, readdirSync, readFileSync, statSync } from "node:fs"
 import nodePath from "node:path"
 import type { ManifestField } from "./config.ts"
 import { matchesGlob } from "./glob.ts"
+import { attempt, failure, messageOf, success } from "./result.ts"
+import type { Result } from "./result.ts"
 
 export interface WorkspacePackage {
   readonly name: string
@@ -36,20 +38,19 @@ interface Manifest {
   readonly peerDependencies?: unknown
 }
 
-const readManifest = (path: string): Manifest => {
-  let parsed: unknown
+/** The manifest at `path`, or why it cannot be read. */
+const readManifest = (path: string): Result<Manifest, string> => {
+  const parsed = attempt((): unknown => JSON.parse(readFileSync(path, "utf8")))
 
-  try {
-    parsed = JSON.parse(readFileSync(path, "utf8"))
-  } catch (cause) {
-    throw new Error(`${path}: ${cause instanceof Error ? cause.message : String(cause)}`, { cause })
+  if (!parsed.ok) {
+    return failure(`${path}: ${messageOf(parsed.error)}`)
   }
 
-  if (typeof parsed !== "object" || parsed === null) {
-    throw new Error(`${path} is not a JSON object`)
+  if (typeof parsed.value !== "object" || parsed.value === null) {
+    return failure(`${path} is not a JSON object`)
   }
 
-  return parsed
+  return success(parsed.value)
 }
 
 const namesOf = (field: unknown): readonly string[] =>
@@ -95,12 +96,10 @@ const workspaceGlobs = (manifest: Manifest): readonly string[] | undefined => {
   return undefined
 }
 
-const workspacesOf = (manifest: string): readonly string[] => {
-  try {
-    return workspaceGlobs(readManifest(manifest)) ?? []
-  } catch {
-    return []
-  }
+const workspacesOf = (path: string): readonly string[] => {
+  const manifest = readManifest(path)
+
+  return manifest.ok ? (workspaceGlobs(manifest.value) ?? []) : []
 }
 
 /** Whether `globs` (from the manifest in `candidate`) hold `directory`: one of them matches it or a directory above it. */
@@ -192,7 +191,13 @@ export const directoriesMatching = (root: string, pattern: string): string[] => 
 }
 
 export const loadWorkspace = (root: string): Workspace => {
-  const rootManifest = readManifest(nodePath.join(root, "package.json"))
+  const rootRead = readManifest(nodePath.join(root, "package.json"))
+
+  if (!rootRead.ok) {
+    throw new Error(rootRead.error)
+  }
+
+  const rootManifest = rootRead.value
   const globs = workspaceGlobs(rootManifest) ?? []
   const directories = new Set<string>()
 
@@ -217,14 +222,14 @@ export const loadWorkspace = (root: string): Workspace => {
   const byName = new Map<string, WorkspacePackage>()
 
   for (const directory of [...directories].toSorted()) {
-    let manifest: Manifest
+    const read = readManifest(nodePath.join(root, directory, "package.json"))
 
-    try {
-      manifest = readManifest(nodePath.join(root, directory, "package.json"))
-    } catch (error) {
-      problems.push({ directory, message: `package.json cannot be read: ${error instanceof Error ? error.message : String(error)}` })
+    if (!read.ok) {
+      problems.push({ directory, message: `package.json cannot be read: ${read.error}` })
       continue
     }
+
+    const manifest = read.value
 
     if (typeof manifest.name !== "string" || manifest.name === "") {
       problems.push({ directory, message: "package.json has no name, so nothing can import it and its kind cannot be known" })
