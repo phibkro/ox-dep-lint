@@ -102,7 +102,7 @@ Releases are published from a `v*` tag by `.github/workflows/release.yml`, with 
 
 ## Running it
 
-The CLI walks every workspace package's directory, dot directories included (`src/.internal/`), skipping only `node_modules` and `.git` and reading nothing under `output`, so generated and gitignored sources and nested repositories are checked too, and runs the whole-graph checks. Tool caches such as `.wrangler` and `.astro` are in the default `output`; for another cache, set `output` to the defaults plus its glob, since `output` replaces the defaults. The CLI never follows a symbolic link: every link is a `symbolic-link` finding, and a directory it cannot list is an `unreadable-path` finding, so no source escapes the check unreported.
+The CLI walks every workspace package's directory, dot directories included (`src/.internal/`), skipping only `node_modules` and `.git` and reading nothing under `output`, so generated and gitignored sources and nested repositories are checked too, and runs the whole-graph checks. Tool caches such as `.wrangler` and `.astro` are in the default `output`; for another cache, set `output` to the defaults plus its glob, since `output` replaces the defaults. The CLI never follows a symbolic link: every link is a `symbolic-link` finding, and a directory it cannot list or a file it cannot read is an `unreadable-path` finding. What it still does not report: plain files directly at a workspace glob's level (`packages/x.ts`), and FIFOs and sockets.
 
 ```sh
 ox-dep-lint            # finds ox-dep-lint.config.{ts,mts,js,mjs,json} at the workspace root
