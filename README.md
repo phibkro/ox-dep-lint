@@ -74,6 +74,14 @@ A kind may use its own kind only when `mayUse` lists it. `imports` holds the pol
 | `manifestEdgeFields` | all four fields    | any subset       |
 | `requireDeclared`    | `true`             | `false`          |
 
+## Installing
+
+```sh
+bun add --dev ox-dep-lint   # or npm install --save-dev ox-dep-lint
+```
+
+Releases are published from a `v*` tag by `.github/workflows/release.yml`, with npm provenance.
+
 ## Running it
 
 The CLI checks every file that git tracks or would track (so ignored files are skipped), and runs the whole-graph checks too:
