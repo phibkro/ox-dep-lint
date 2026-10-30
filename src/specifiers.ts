@@ -5,8 +5,9 @@
  * - module syntax: `import`, `export ... from`, `import()`, the type-level `import("...")`, `import x = require("...")`,
  *   a string-named `declare module "..."`, and `/// <reference types="..." />`;
  * - loaders: `require`, `require.resolve`, `module.require`, `import.meta.require`, `import.meta.resolve`,
- *   `process.getBuiltinModule`, a `createRequire(...)` call applied directly, and `new URL("...", import.meta.url)`
- *   (how Vite and browsers load workers and assets);
+ *   `process.getBuiltinModule`, a `createRequire(...)` call applied directly, and a worker URL
+ *   (`new Worker(new URL("...", import.meta.url))`). A `require` passed around as a value is not followed: telling the
+ *   global loader from a local of the same name needs scope analysis, which this version does not do;
  * - a specifier is checked by the string it spells (the parser's decoded value), so an escape sequence cannot disguise
  *   it; the escape is reported as well, since its source text is not the module it loads.
  *
@@ -69,7 +70,11 @@ const loaders = new Set([
 const locators = new Set(["require.resolve", "import.meta.resolve"])
 
 /** `(require)`, `(0, require)` and `( require )` are `require`. */
-const plainCallee = (callee: string) => callee.replace(/^\((?:0,)?(.*)\)$/su, "$1").replaceAll("?.", ".")
+const plainCallee = (callee: string) =>
+  callee
+    .replace(/!$/u, "")
+    .replace(/^\((?:0,)?(.*)\)$/su, "$1")
+    .replaceAll("?.", ".")
 
 /** Line (1-based) and column (0-based) of each offset, from the line starts of `text`. */
 const locator = (text: string) => {
@@ -144,17 +149,6 @@ export const importForms = (path: string, source: string): ImportForms => {
 
   // `createRequire(import.meta.url)("x")` is read as a require of "x"; the inner call is then not a finding of its own.
   const appliedCreateRequire = new Set<number>()
-  // `require` in a value position: passed, stored or returned, so the check cannot follow what it loads.
-  const sequenceCallees = new Set<number>()
-
-  const requireValue = (node: object | null | undefined) => {
-    const candidate: { type?: unknown; name?: unknown; start?: unknown; end?: unknown } = node ?? {}
-
-    if (candidate.type === "Identifier" && candidate.name === "require" && typeof candidate.start === "number" && typeof candidate.end === "number") {
-      refuse({ start: candidate.start, end: candidate.end }, "require is used as a value, so the check cannot follow what it loads")
-    }
-  }
-
   /** The `new URL(...)` inside `new URL(...).href` or `new URL(...).toString()`. */
   const innermostUrl = (node: LiteralLike | undefined): LiteralLike | undefined => {
     const shaped = node as (LiteralLike & { readonly object?: LiteralLike; readonly callee?: LiteralLike }) | undefined
@@ -226,16 +220,6 @@ export const importForms = (path: string, source: string): ImportForms => {
       const callee = plainCallee(compact(text.slice(node.callee.start, node.callee.end)))
       const [first] = node.arguments
 
-      for (const argument of node.arguments) {
-        requireValue(argument)
-      }
-
-      if (node.callee.type === "SequenceExpression") {
-        sequenceCallees.add(node.callee.start)
-      } else if (node.callee.type === "ParenthesizedExpression" && node.callee.expression.type === "SequenceExpression") {
-        sequenceCallees.add(node.callee.expression.start)
-      }
-
       if (callee === "navigator.serviceWorker.register") {
         readWorkerUrl(first?.type === "SpreadElement" ? undefined : first)
       } else if (locators.has(callee)) {
@@ -263,60 +247,6 @@ export const importForms = (path: string, source: string): ImportForms => {
         readWorkerUrl(node.arguments[0])
       }
     },
-    VariableDeclarator(node) {
-      requireValue(node.init)
-    },
-    AssignmentExpression(node) {
-      requireValue(node.right)
-    },
-    ArrayExpression(node) {
-      for (const element of node.elements) {
-        requireValue(element)
-      }
-    },
-    ObjectExpression(node) {
-      // `{ require }` and `{ load: require }` pass the loader along; a destructuring pattern is not an ObjectExpression.
-      for (const property of node.properties) {
-        requireValue(property.type === "Property" ? property.value : property.argument)
-      }
-    },
-    ReturnStatement(node) {
-      requireValue(node.argument)
-    },
-    ArrowFunctionExpression(node) {
-      requireValue(node.expression ? node.body : undefined)
-    },
-    ConditionalExpression(node) {
-      requireValue(node.consequent)
-      requireValue(node.alternate)
-    },
-    LogicalExpression(node) {
-      requireValue(node.left)
-      requireValue(node.right)
-    },
-    SequenceExpression(node) {
-      // `(0, require)("x")` is read as a call; `(0, require)` alone hands the loader on.
-      if (!sequenceCallees.has(node.start)) {
-        for (const expression of node.expressions) {
-          requireValue(expression)
-        }
-      }
-    },
-    SpreadElement(node) {
-      requireValue(node.argument)
-    },
-    ExportDefaultDeclaration(node) {
-      requireValue(node.declaration)
-    },
-    TSAsExpression(node) {
-      requireValue(node.expression)
-    },
-    TSSatisfiesExpression(node) {
-      requireValue(node.expression)
-    },
-    TSNonNullExpression(node) {
-      requireValue(node.expression)
-    },
     TSImportEqualsDeclaration(node) {
       if (node.moduleReference.type === "TSExternalModuleReference") {
         add(node.moduleReference.expression, node.importKind === "type")
@@ -333,7 +263,6 @@ export const importForms = (path: string, source: string): ImportForms => {
     },
   }).visit(program)
 
-  // `const load = require`, `[require].map(...)`: a require passed around loads modules the check cannot follow.
   for (const comment of comments) {
     const name = comment.type === "Line" ? typesReference.exec(comment.value.trim())?.groups?.name : undefined
 

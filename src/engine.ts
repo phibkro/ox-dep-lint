@@ -327,7 +327,10 @@ export const findingsForFile = (engine: Engine, file: string, text: string, opti
           toRelative !== undefined &&
           (!reads(engine, target.file) || effectivePolicy(engine, to, toRelative) !== "shipped")
         ) {
-          judgeDevelopmentImport(target.file, `${specifier}, a development file of ${to.name} (${target.file}),`)
+          judgeDevelopmentImport(
+            target.file,
+            `${specifier}, ${reads(engine, target.file) ? "a development file" : "a file the check does not otherwise read"} of ${to.name} (${target.file}),`,
+          )
         }
 
         if (to.name === owner.name) {

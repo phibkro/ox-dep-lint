@@ -217,6 +217,15 @@ const shapeProblems = (config: unknown): string[] => {
     }
   }
 
+  for (const [key, value] of [
+    ["imports", (config as Record<string, unknown>).imports],
+    ["runtimeModules", (config as Record<string, unknown>).runtimeModules],
+  ] as const) {
+    if (value !== undefined && !isObject(value)) {
+      problems.push(`${key} must be an object`)
+    }
+  }
+
   for (const [key, list] of [
     ["fileClasses", fileClasses],
     ["baseline", baseline],

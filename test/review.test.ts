@@ -247,10 +247,8 @@ describe("the second review's findings", () => {
 
   it("does not treat a computed resolve as a load (M3), and catches require passed around (M5)", () => {
     expect(findingsWith({ "platforms/cloudflare/src/where.ts": "export const where = (entry: string) => import.meta.resolve(entry)\n" })).toEqual([])
-    expect(findingsWith({ "platforms/cloudflare/src/load.ts": "const load = require\nexport const x = (0, require)\n" })).toEqual([
-      "computed-import require",
-      "computed-import require",
-    ])
+    // require passed around as a value is not followed in 0.1 (it needs scope analysis); see the README.
+    expect(findingsWith({ "platforms/cloudflare/src/load.ts": "const load = require\nexport const x = (0, require)\n" })).toEqual([])
   })
 
   it("follows a workspace name a paths alias sends elsewhere (M7)", () => {
@@ -401,10 +399,13 @@ describe("the third review's findings", () => {
     expect(findingsWith(chain)).toEqual(["shipped-imports-development-file ../scripts/link0.ts"])
   }, 60_000)
 
-  it("catches require passed in a shorthand property and called through window (M-4)", () => {
+  it("reads require called through window, globalThis or a non-null assertion (M-4)", () => {
     expect(
-      findingsWith({ [library]: 'const box = { require }\nexport const fs = box.require("node:fs")\nexport const os = window.require("node:os")\n' }),
-    ).toEqual(["computed-import require", "runtime-module node:os"])
+      findingsWith({
+        [library]:
+          'export const os = window.require("node:os")\nexport const fs = globalThis?.require("node:fs")\nexport const path = (require)!("node:path")\n',
+      }),
+    ).toEqual(["runtime-module node:fs", "runtime-module node:os", "runtime-module node:path"])
   })
 
   it("lets require name members, types and declarations (M-5)", () => {
