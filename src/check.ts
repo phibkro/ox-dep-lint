@@ -12,17 +12,17 @@ import {
   reportsLink,
   skipsDirectory,
   symbolicLinkFinding,
-  unreadableDirectoryFinding,
+  unreadablePathFinding,
   withoutBaselined,
 } from "./engine.ts"
 import type { Engine, Finding } from "./engine.ts"
 import { graphFindings, staleBaseline } from "./graph.ts"
-import { codeOf } from "./result.ts"
+import { attempt, codeOf } from "./result.ts"
 
 /** The source files of the workspace's packages, and what kept the walk from seeing all of them. */
 export interface SourceWalk {
   readonly files: readonly string[]
-  /** A `symbolic-link` finding for each link outside the directories it skips, an `unreadable-directory` one for each directory it could not list. */
+  /** A `symbolic-link` finding for each link outside the directories it skips, an `unreadable-path` one for each directory it could not list. */
   readonly findings: readonly Finding[]
 }
 
@@ -45,7 +45,7 @@ export const walkSources = (engine: Engine): SourceWalk => {
       entries = readdirSync(nodePath.join(root, relative), { withFileTypes: true })
     } catch (cause) {
       if (!skipsDirectory(engine, relative)) {
-        findings.set(relative, unreadableDirectoryFinding(relative, codeOf(cause)))
+        findings.set(relative, unreadablePathFinding(relative, codeOf(cause)))
       }
 
       return
@@ -88,7 +88,11 @@ export const checkWorkspace = (root: string, config: Config): CheckResult => {
   const { files, findings: walked } = walkSources(engine)
   // A package with no kind is reported once, from its package.json, by the graph checks.
   const perFile = files
-    .flatMap((file) => findingsForFile(engine, file, readFileSync(nodePath.join(root, file), "utf8")))
+    .flatMap((file) => {
+      const text = attempt(() => readFileSync(nodePath.join(root, file), "utf8"))
+
+      return text.ok ? findingsForFile(engine, file, text.value) : [unreadablePathFinding(file, codeOf(text.error), "file")]
+    })
     .filter((finding) => finding.rule !== "package-without-kind")
   const all = [...walked, ...perFile, ...graphFindings(engine)]
 

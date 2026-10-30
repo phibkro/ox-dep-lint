@@ -2,7 +2,7 @@
  * What the walk cannot see through: symbolic links (reported, never followed), directories it cannot list, and
  * directories the workspaces match that no package owns. Each case plants one thing in the valid workspace.
  */
-import { chmodSync, mkdirSync, readdirSync, symlinkSync } from "node:fs"
+import { chmodSync, mkdirSync, readdirSync, readFileSync, symlinkSync } from "node:fs"
 import nodePath from "node:path"
 import { describe, expect, it, vi } from "vite-plus/test"
 import { checkWorkspace, listSourceFiles } from "../src/check.ts"
@@ -10,26 +10,29 @@ import type { Config } from "../src/config.ts"
 import { defaultFileClasses } from "../src/config.ts"
 import { createEngine } from "../src/engine.ts"
 import type { Files } from "./support/workspace.ts"
-import { removeWorkspace, validConfig, validWorkspace, writeWorkspace } from "./support/workspace.ts"
+import { removeWorkspace, validConfig, validWorkspace, writeWorkspace, writeWorkspaceFiles } from "./support/workspace.ts"
 
-/** Directories whose listing fails with EACCES, whoever runs the test (root reads a directory whatever its mode). */
+/** Paths whose listing or reading fails with EACCES, whoever runs the test (root reads a path whatever its mode). */
 const denied = vi.hoisted(() => new Set<string>())
 
 vi.mock(import("node:fs"), async (importOriginal) => {
   const actual = await importOriginal()
-  // SAFETY: called only as a forwarder below, with the arguments of whichever overload the caller used.
-  const forward = actual.readdirSync as (path: string, options?: unknown) => unknown
-  const denying = (path: string, options?: unknown): unknown => {
-    if (denied.has(String(path))) {
-      throw Object.assign(new Error(`EACCES: permission denied, scandir '${String(path)}'`), { code: "EACCES" })
+  /** `call` for a path not in `denied`, with its arguments unchanged; for one in `denied`, the error a mode of 000 gives. */
+  const denying =
+    (call: (path: string, options?: unknown) => unknown, operation: string) =>
+    (path: string, options?: unknown): unknown => {
+      if (denied.has(String(path))) {
+        throw Object.assign(new Error(`EACCES: permission denied, ${operation} '${String(path)}'`), { code: "EACCES" })
+      }
+
+      return call(path, options)
     }
+  // SAFETY: each wrapper passes every call through unchanged (so it returns what that overload returns) or throws.
+  const readdirSync = denying(actual.readdirSync as (path: string, options?: unknown) => unknown, "scandir") as typeof actual.readdirSync
+  // SAFETY: as above.
+  const readFileSync = denying(actual.readFileSync as (path: string, options?: unknown) => unknown, "open") as typeof actual.readFileSync
 
-    return forward(path, options)
-  }
-  // SAFETY: `denying` passes every call through unchanged (so it returns what that overload returns) or throws.
-  const listing = denying as typeof actual.readdirSync
-
-  return { ...actual, default: { ...actual, readdirSync: listing }, readdirSync: listing }
+  return { ...actual, default: { ...actual, readdirSync, readFileSync }, readdirSync, readFileSync }
 })
 
 /** A path to link from (repository-relative) and the destination the link names, as written. */
@@ -181,13 +184,57 @@ describe("dot directories", () => {
   })
 })
 
+describe("dot directories a workspaces glob would match", () => {
+  it("reports one, with or without a package.json, as no package, and reads nothing in it", () => {
+    expect(
+      check({
+        "tools/.template/x.ts": 'import { readFileSync } from "node:fs"\nimport "@acme/ghost"\n',
+        "libraries/.template/package.json": { name: "@acme/template" },
+        "libraries/.template/src/index.ts": 'import { readFileSync } from "node:fs"\nexport const read = readFileSync\n',
+        "tools/.git/x.ts": 'import "@acme/ghost"\n',
+      }),
+    ).toEqual(["directory-without-package libraries/.template libraries/.template", "directory-without-package tools/.template tools/.template"])
+  })
+})
+
+describe("tool caches under a package", () => {
+  // As wrangler writes them: a bundle importing runtime modules and absolute paths into dist and node_modules.
+  const wrangler = (root: string): Files => ({
+    "platforms/cloudflare/.wrangler/tmp/bundle-x/index.js":
+      'import { DurableObject } from "cloudflare:workers"\nimport { Effect } from "effect"\nimport "@acme/web"\nexport class RoomObject extends DurableObject {}\nexport const e = Effect\n',
+    "platforms/cloudflare/.wrangler/tmp/bundle-x/middleware-loader.entry.ts": `import worker from "${root}/platforms/cloudflare/dist/worker.js"\nimport * as drain from "${root}/node_modules/wrangler/templates/middleware/drain.ts"\nexport default [worker, drain]\n`,
+  })
+
+  it("does not read .wrangler and the other caches by default", () => {
+    const root = writeWorkspace(validWorkspace)
+
+    try {
+      writeWorkspaceFiles(root, wrangler(root))
+      expect(checkWorkspace(root, validConfig).findings).toEqual([])
+    } finally {
+      removeWorkspace(root)
+    }
+  })
+
+  it("reads them when output replaces the defaults", () => {
+    const root = writeWorkspace(validWorkspace)
+
+    try {
+      writeWorkspaceFiles(root, wrangler(root))
+      expect(checkWorkspace(root, { ...validConfig, output: ["dist/**"] }).findings.map((finding) => finding.rule)).toContain("forbidden-edge")
+    } finally {
+      removeWorkspace(root)
+    }
+  })
+})
+
 describe("directories the walk cannot read", () => {
   it("reports a directory it cannot list instead of skipping it or failing", () => {
     expect(
       check({ [`${source}/locked/c.ts`]: 'import "@acme/platform-cloudflare"\n' }, {}, validConfig, (root) => {
         denied.add(nodePath.join(root, source, "locked"))
       }),
-    ).toEqual([`unreadable-directory ${source}/locked ${source}/locked`])
+    ).toEqual([`unreadable-path ${source}/locked ${source}/locked`])
   })
 
   it("negative control: an unreadable directory the check would not read anyway is no finding", () => {
@@ -219,10 +266,40 @@ describe("directories the walk cannot read", () => {
       ),
     ).toEqual([
       "directory-without-package libraries/stray libraries/stray",
-      "unreadable-directory extras extras",
+      "unreadable-path extras extras",
       // Inside a member, once: the walk reports it, and the glob leaves it to the walk.
-      `unreadable-directory ${source}/locked ${source}/locked`,
+      `unreadable-path ${source}/locked ${source}/locked`,
     ])
+  })
+
+  it("reports a source file it cannot read instead of failing", () => {
+    expect(
+      check({}, {}, validConfig, (root) => {
+        denied.add(nodePath.join(root, source, "size.ts"))
+      }),
+    ).toEqual([`unreadable-path ${source}/size.ts ${source}/size.ts`])
+  })
+
+  it("reports a file whose mode forbids reading it (chmod 000)", (context) => {
+    const root = writeWorkspace(validWorkspace)
+    const locked = nodePath.join(root, source, "size.ts")
+
+    try {
+      chmodSync(locked, 0o000)
+
+      try {
+        readFileSync(locked)
+        // Root, or a process with CAP_DAC_OVERRIDE, reads it anyway; the case above covers that run.
+        context.skip()
+      } catch {
+        // The mode holds for this process.
+      }
+
+      expect(checkWorkspace(root, validConfig).findings.map((finding) => `${finding.rule} ${finding.file}`)).toEqual([`unreadable-path ${source}/size.ts`])
+    } finally {
+      chmodSync(locked, 0o644)
+      removeWorkspace(root)
+    }
   })
 
   it("reports a directory whose mode forbids reading it (chmod 000)", (context) => {
@@ -240,7 +317,7 @@ describe("directories the walk cannot read", () => {
         // The mode holds for this process.
       }
 
-      expect(checkWorkspace(root, validConfig).findings.map((finding) => `${finding.rule} ${finding.file}`)).toEqual([`unreadable-directory ${source}/locked`])
+      expect(checkWorkspace(root, validConfig).findings.map((finding) => `${finding.rule} ${finding.file}`)).toEqual([`unreadable-path ${source}/locked`])
     } finally {
       chmodSync(locked, 0o755)
       removeWorkspace(root)
@@ -265,7 +342,7 @@ describe("directories the workspaces match that no package owns", () => {
           denied.add(nodePath.join(root, "libraries/locked"))
         },
       ),
-    ).toEqual(["symbolic-link libraries/linked ../elsewhere", "unreadable-directory libraries/locked libraries/locked"])
+    ).toEqual(["symbolic-link libraries/linked ../elsewhere", "unreadable-path libraries/locked libraries/locked"])
   })
 
   it("negative control: an ignored, a negated and a nested directory, and a link to a file, are no finding", () => {
@@ -334,6 +411,20 @@ describe("directories the workspaces match that no package owns", () => {
       workspaces: ["libraries/*", "services/*", "platforms/*", "apps/*", "tools/*", "!tools/legacy/**"],
     }
     expect(check({ "package.json": root, "tools/legacy/old.ts": "export {}\n" })).toEqual([])
+  })
+
+  it("reports a link a kind names literally, outside the workspaces", () => {
+    const config: Config = { ...validConfig, kinds: { ...validConfig.kinds, extra: { packages: ["extras/linked"], mayUse: [] } } }
+    expect(check({ ...elsewhere, "elsewhere/package.json": { name: "@acme/elsewhere" } }, { "extras/linked": "../elsewhere" }, config)).toEqual([
+      "symbolic-link extras/linked ../elsewhere",
+    ])
+  })
+
+  it("reports a glob's base that is a link, and finds no package through it", () => {
+    const root = { ...(validWorkspace["package.json"] as object), workspaces: ["libraries/*", "services/*", "platforms/*", "apps/*", "tools/*", "extras/*"] }
+    expect(
+      check({ "package.json": root, "stash/one/package.json": { name: "@acme/one" }, "stash/one/src/index.ts": "export {}\n" }, { extras: "stash" }),
+    ).toEqual(["symbolic-link extras stash"])
   })
 
   it("can be baselined, and a baseline entry no directory needs is stale", () => {

@@ -47,7 +47,7 @@ export const ruleNames = [
   "directory-without-package",
   "invalid-package",
   "symbolic-link",
-  "unreadable-directory",
+  "unreadable-path",
   "forbidden-edge",
   "type-only-edge",
   "relative-import-leaves-package",
@@ -151,8 +151,22 @@ export const defaultFileClasses: readonly FileClass[] = [
   },
 ]
 
-/** Build output and coverage reports under a package, never read unless `output` says otherwise. */
-export const defaultOutput: readonly string[] = ["dist/**", "coverage/**"]
+/**
+ * Build output, coverage reports and the caches tools write under a package root (generated, never written by hand),
+ * never read unless `output` says otherwise. Shipped code that imports from them is still judged.
+ */
+export const defaultOutput: readonly string[] = [
+  "dist/**",
+  "coverage/**",
+  ".wrangler/**",
+  ".astro/**",
+  ".svelte-kit/**",
+  ".next/**",
+  ".turbo/**",
+  ".vercel/**",
+  ".nuxt/**",
+  ".output/**",
+]
 
 const allManifestFields: readonly ManifestField[] = ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"]
 

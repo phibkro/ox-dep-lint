@@ -9,14 +9,18 @@ export type Files = Readonly<Record<string, string | object>>
 
 export const writeWorkspace = (files: Files): string => {
   const root = mkdtempSync(nodePath.join(tmpdir(), "ox-dep-lint-"))
+  writeWorkspaceFiles(root, files)
 
+  return root
+}
+
+/** Writes `files` into the existing workspace at `root`. */
+export const writeWorkspaceFiles = (root: string, files: Files) => {
   for (const [path, contents] of Object.entries(files)) {
     const absolute = nodePath.join(root, path)
     mkdirSync(nodePath.dirname(absolute), { recursive: true })
     writeFileSync(absolute, typeof contents === "string" ? contents : `${JSON.stringify(contents, null, 2)}\n`)
   }
-
-  return root
 }
 
 export const removeWorkspace = (root: string) => {

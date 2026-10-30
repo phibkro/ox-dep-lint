@@ -11,6 +11,7 @@ import type { BaselineEntry, Config, FilePolicy, ManifestField, ResolvedConfig, 
 import { matchesAny, matchesGlob } from "./glob.ts"
 import { isRuntimeModule, makeResolver, withoutQuery } from "./resolve.ts"
 import type { Resolver, Target } from "./resolve.ts"
+import { attempt, codeOf } from "./result.ts"
 import { importForms } from "./specifiers.ts"
 import { loadWorkspace, packageNameOf, packageOfFile } from "./workspace.ts"
 import type { Workspace, WorkspacePackage } from "./workspace.ts"
@@ -257,14 +258,17 @@ export const symbolicLinkFinding = (path: string, destination: string): Finding 
   target: destination,
 })
 
-/** A directory the check needed to read and could not, with the error code that said why. */
-export const unreadableDirectoryFinding = (directory: string, code: string): Finding => ({
-  rule: "unreadable-directory",
-  file: directory,
+/** A directory the check needed to list, or a source file it needed to read, and could not, with the error code that said why. */
+export const unreadablePathFinding = (path: string, code: string, kind: "directory" | "file" = "directory"): Finding => ({
+  rule: "unreadable-path",
+  file: path,
   line: 1,
   column: 0,
-  message: `${directory} cannot be read (${code}), so the files in it cannot be checked: make it readable, or add ${directory}/** to ignore`,
-  target: directory,
+  message:
+    kind === "directory"
+      ? `${path} cannot be read (${code}), so the files in it cannot be checked: make it readable, or add ${path}/** to ignore`
+      : `${path} cannot be read (${code}), so its imports cannot be checked: make it readable, or add it to ignore`,
+  target: path,
 })
 
 /** The destination a symbolic link names, as written. */
@@ -352,9 +356,14 @@ export const developmentFileBreaks = (engine: Engine, file: string): string | un
     const directory = nodePath.dirname(next)
     read.set(directory, modifiedTime(nodePath.join(engine.workspace.root, directory)) ?? -1)
     const reached: string[] = []
-    const finding = findingsForFile(engine, next, readFileSync(absolute, "utf8"), { developmentImports: reached }).find((candidate) =>
-      shippedOnlyRules.has(candidate.rule),
-    )
+    const text = attempt(() => readFileSync(absolute, "utf8"))
+
+    if (!text.ok) {
+      breaks = `${next} cannot be read (${codeOf(text.error)}), so it cannot be judged`
+      break
+    }
+
+    const finding = findingsForFile(engine, next, text.value, { developmentImports: reached }).find((candidate) => shippedOnlyRules.has(candidate.rule))
 
     if (finding !== undefined) {
       breaks = `${next === file ? "" : `through ${next}, `}${finding.rule} at line ${finding.line}: ${finding.message}`

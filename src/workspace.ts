@@ -146,22 +146,34 @@ export const findWorkspaceRoot = (start: string): string | undefined => {
   }
 }
 
-const isSymbolicLink = (absolute: string): boolean => {
-  const status = attempt(() => lstatSync(absolute))
+/** The first of `path`'s directories (repository-relative), itself included, that is a symbolic link. */
+const linkAlong = (root: string, path: string): string | undefined => {
+  const parts = path === "" ? [] : path.split("/")
 
-  return status.ok && status.value.isSymbolicLink()
-}
+  return parts
+    .map((_, index) => parts.slice(0, index + 1).join("/"))
+    .find((prefix) => {
+      const status = attempt(() => lstatSync(nodePath.join(root, prefix)))
 
-/** What `directoriesMatching` met and did not descend into: symbolic links the pattern matches, and directories it could not list. */
-export interface Unlisted {
-  readonly links: string[]
-  readonly unreadable: { readonly directory: string; readonly code: string }[]
+      return status.ok && status.value.isSymbolicLink()
+    })
 }
 
 /**
- * The directories under `root` that `pattern` matches, skipping `node_modules` and dot directories. A symbolic link is
- * never followed, not even one the pattern names literally, and a directory that cannot be listed is passed over; with
- * `unlisted`, both are collected there, so the caller can report them.
+ * What `directoriesMatching` met and did not descend into: symbolic links the pattern matches or passes through,
+ * directories it could not list, and dot directories it matches (other than `.git`), which workspaces globs never match.
+ */
+export interface Unlisted {
+  readonly links: string[]
+  readonly unreadable: { readonly directory: string; readonly code: string }[]
+  readonly dotDirectories: string[]
+}
+
+/**
+ * The directories under `root` that `pattern` matches, skipping `node_modules` and dot directories, as npm and Bun
+ * workspaces do. A symbolic link is never followed, not even one the pattern names literally or passes through (a
+ * `packages` that is a link), and a directory that cannot be listed is passed over; with `unlisted`, those and the dot
+ * directories the pattern would match are collected there, so the caller can report them.
  */
 export const directoriesMatching = (root: string, pattern: string, unlisted?: Unlisted): string[] => {
   const negated = pattern.startsWith("!")
@@ -202,19 +214,23 @@ export const directoriesMatching = (root: string, pattern: string, unlisted?: Un
 
       if (entry.isDirectory() && entry.name !== "node_modules" && !entry.name.startsWith(".")) {
         walk(path, depth + 1)
+      } else if (entry.isDirectory() && entry.name.startsWith(".") && entry.name !== ".git" && matchesGlob(path, clean)) {
+        unlisted?.dotDirectories.push(path)
       } else if (entry.isSymbolicLink() && matchesGlob(path, clean)) {
         unlisted?.links.push(path)
       }
     }
   }
 
+  const link = linkAlong(root, base)
+
+  if (link !== undefined) {
+    unlisted?.links.push(link)
+
+    return []
+  }
+
   if (base === clean) {
-    if (isSymbolicLink(nodePath.join(root, base))) {
-      unlisted?.links.push(base)
-
-      return []
-    }
-
     return existsSync(nodePath.join(root, base)) ? [base] : []
   }
 
