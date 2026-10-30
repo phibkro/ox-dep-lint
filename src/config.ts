@@ -93,6 +93,14 @@ export interface ImportPolicy {
   readonly requireDeclared?: boolean
   /** The fields that satisfy a shipped import. Default `dependencies`, `peerDependencies`, `optionalDependencies`. */
   readonly shippedFields?: readonly ManifestField[]
+  /**
+   * How shipped code's type-only imports (`import type`, `export type`, a type-level `import()`, `declare module`, a
+   * types reference) are judged by `runtime-module`, `forbidden-external`, `undeclared-import` and
+   * `shipped-imports-development-file`. `"relaxed"` (default): types do not load, so those rules skip them and
+   * devDependencies declare them. `"as-values"`: judged like value imports, for kinds whose public types must not name
+   * a runtime or vendor either. Kind edges and `typeOnlyUses` always see the real form.
+   */
+  readonly typeOnly?: "relaxed" | "as-values"
 }
 
 export interface Config {
@@ -165,7 +173,7 @@ const allowedKeys = {
   package: ["uses", "externals", "typeOnlyUses", "valueSpecifiers", "testSupportFiles"],
   fileClass: ["files", "policy"],
   runtimeModules: ["prefixes", "names"],
-  imports: ["computed", "selfByName", "unresolved", "manifestEdgeFields", "requireDeclared", "shippedFields"],
+  imports: ["computed", "selfByName", "unresolved", "manifestEdgeFields", "requireDeclared", "shippedFields", "typeOnly"],
   baseline: ["file", "rule", "target", "reason"],
 }
 
@@ -174,6 +182,7 @@ const choices: Record<string, readonly unknown[]> = {
   selfByName: ["error", "allow"],
   unresolved: ["error", "ignore"],
   requireDeclared: [true, false],
+  typeOnly: ["relaxed", "as-values"],
 }
 
 const isStringList = (value: unknown): boolean => Array.isArray(value) && value.every((item) => typeof item === "string")
@@ -389,6 +398,7 @@ export const resolveConfig = (config: Config): ResolvedConfig => {
       manifestEdgeFields: config.imports?.manifestEdgeFields ?? allManifestFields,
       requireDeclared: config.imports?.requireDeclared ?? true,
       shippedFields: config.imports?.shippedFields ?? ["dependencies", "peerDependencies", "optionalDependencies"],
+      typeOnly: config.imports?.typeOnly ?? "relaxed",
     },
     baseline: config.baseline ?? [],
     ignore: config.ignore ?? [],

@@ -521,3 +521,9 @@ describe("the fourth review's findings", () => {
     ])
   })
 })
+
+describe("imports.typeOnly", () => {
+  it("is a configuration error when it is not relaxed or as-values", () => {
+    expect(configProblems({ ...validConfig, imports: { typeOnly: "strict" } } as unknown as Config).join("\n")).toContain("imports.typeOnly")
+  })
+})

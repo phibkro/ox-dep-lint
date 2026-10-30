@@ -4,15 +4,31 @@
  * module graph checks of phibkro/file-transfer, phibkro/vektorprogrammet-reimagined and reebeat/reebeat.
  */
 import { readFileSync, statSync } from "node:fs"
+import { builtinModules } from "node:module"
 import nodePath from "node:path"
 import { resolveConfig } from "./config.ts"
 import type { BaselineEntry, Config, FilePolicy, ManifestField, ResolvedConfig, RuleName } from "./config.ts"
 import { matchesAny } from "./glob.ts"
-import { makeResolver, withoutQuery } from "./resolve.ts"
-import type { Resolver } from "./resolve.ts"
+import { isRuntimeModule, makeResolver, withoutQuery } from "./resolve.ts"
+import type { Resolver, Target } from "./resolve.ts"
 import { importForms } from "./specifiers.ts"
-import { loadWorkspace, packageOfFile } from "./workspace.ts"
+import { loadWorkspace, packageNameOf, packageOfFile } from "./workspace.ts"
 import type { Workspace, WorkspacePackage } from "./workspace.ts"
+
+const nodeModules = ["node:module", ...builtinModules]
+
+/**
+ * Packages that hold a runtime's types, and the runtime modules they describe: the package counts as the runtime when
+ * the configuration names any of them a runtime module (Node's by its `node:` prefix or any bare built-in).
+ */
+const runtimeTypePackages: Readonly<Record<string, readonly string[]>> = {
+  node: nodeModules,
+  "@types/node": nodeModules,
+  bun: ["bun"],
+  "bun-types": ["bun"],
+  "@types/bun": ["bun"],
+  "@cloudflare/workers-types": ["cloudflare:workers"],
+}
 
 export interface Finding {
   readonly rule: RuleName
@@ -257,10 +273,23 @@ export const findingsForFile = (engine: Engine, file: string, text: string, opti
     }
   }
 
+  /**
+   * The packages that hold a runtime's own types, by the runtime module they describe: a type-only use of one
+   * (`/// <reference types="node" />`, `import type {} from "bun-types"`) is a use of that runtime, judged by
+   * `runtime-module` like `node:fs` and never as an outside package to declare.
+   */
+  const runtimeOf = (site: { readonly specifier: string; readonly typeOnly: boolean }): string | undefined => {
+    const modules = site.typeOnly ? runtimeTypePackages[packageNameOf(site.specifier)] : undefined
+
+    return modules?.find((module) => isRuntimeModule(config, module))
+  }
+
   for (const site of forms.imports) {
-    const { typeOnly } = site
+    // Whether the rules that care about loading skip this import; kind edges below see the real form.
+    const typeOnly = site.typeOnly && config.imports.typeOnly === "relaxed"
     const specifier = withoutQuery(site.specifier)
-    const target = engine.resolver.resolve(file, site.specifier)
+    const runtime = runtimeOf(site)
+    const target: Target = runtime === undefined ? engine.resolver.resolve(file, site.specifier) : { kind: "runtime", name: runtime }
 
     // Judged by what is written and by what it resolves to, so an alias (`#fc` for fast-check) hides nothing.
     // A subpath (`@acme/conformance/guarantee`) is judged as written; only an alias adds the package it stands for.
@@ -290,7 +319,8 @@ export const findingsForFile = (engine: Engine, file: string, text: string, opti
     switch (target.kind) {
       case "runtime": {
         if (shipped && !typeOnly && kindRule?.runtimeModules === false) {
-          report("runtime-module", site, `imports the runtime module ${specifier}, which ${article(kind)} package may not use in shipped code`, specifier)
+          const what = runtime === undefined ? `the runtime module ${specifier},` : `the runtime types package ${specifier},`
+          report("runtime-module", site, `imports ${what} which ${article(kind)} package may not use in shipped code`, specifier)
         }
 
         break
@@ -341,7 +371,7 @@ export const findingsForFile = (engine: Engine, file: string, text: string, opti
           break
         }
 
-        const refusal = edgeRefusal(engine, owner, to, typeOnly, specifier)
+        const refusal = edgeRefusal(engine, owner, to, site.typeOnly, specifier)
 
         if (refusal !== undefined) {
           report(refusal.rule, site, refusal.why, to.name)
@@ -400,7 +430,7 @@ export const findingsForFile = (engine: Engine, file: string, text: string, opti
         const declared =
           declares(engine, owner, target.name, anywhere) ||
           declares(engine, owner, target.written, anywhere) ||
-          (typeOnly && declares(engine, owner, typesPackage(target.name), true))
+          (site.typeOnly && declares(engine, owner, typesPackage(target.name), anywhere))
 
         if (config.imports.requireDeclared && !declared) {
           report(

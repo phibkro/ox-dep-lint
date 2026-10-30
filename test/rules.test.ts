@@ -197,3 +197,90 @@ function rootWith(extra: string) {
     devDependencies: { "fast-check": "1.0.0" },
   }
 }
+
+describe("type-only imports", () => {
+  const asValues: Config = { ...validConfig, imports: { typeOnly: "as-values" } }
+  const bunTypes = 'import type { Socket } from "bun"\nexport type S = Socket\n'
+
+  it("skips the loading rules by default and judges them like values with typeOnly as-values", () => {
+    expect(findingsWith({ [service]: bunTypes })).toEqual([])
+    expect(findingsWith({ [service]: bunTypes }, asValues)).toEqual(["runtime-module bun"])
+    expect(findingsWith({ [library]: 'export type { Buffer } from "node:buffer"\n' }, asValues)).toEqual(["runtime-module node:buffer"])
+  })
+
+  it("rejects a vendor package's types in a kind that may not use it", () => {
+    const declared = {
+      "services/room/package.json": {
+        name: "@acme/service-room",
+        dependencies: { "@acme/parcel": "workspace:*", effect: "1", partyserver: "1" },
+        devDependencies: { "@acme/conformance": "workspace:*" },
+      },
+    }
+    const source = 'import type { Server } from "partyserver"\nexport type S = Server\n'
+    expect(findingsWith({ ...declared, "services/room/src/party.ts": source })).toEqual(["forbidden-external partyserver"])
+    expect(findingsWith({ ...declared, "services/room/src/party.ts": source }, asValues)).toEqual([
+      "forbidden-external partyserver",
+      "forbidden-external partyserver",
+    ])
+  })
+
+  it("needs a shipped field to declare the package, or its @types, with typeOnly as-values", () => {
+    const source = 'import type { Worker } from "wrangler"\nexport type W = Worker\n'
+    expect(findingsWith({ "platforms/cloudflare/src/types.ts": source })).toEqual([])
+    expect(findingsWith({ "platforms/cloudflare/src/types.ts": source }, asValues)).toEqual(["undeclared-import wrangler"])
+
+    const express = 'import type { Request } from "express"\nexport type R = Request\n'
+    const inDevelopment = {
+      "apps/web/package.json": { name: "@acme/web", dependencies: { "@acme/parcel": "workspace:*" }, devDependencies: { "@types/express": "1" } },
+    }
+    const inShipped = { "apps/web/package.json": { name: "@acme/web", dependencies: { "@acme/parcel": "workspace:*", "@types/express": "1" } } }
+    expect(findingsWith({ ...inDevelopment, "apps/web/src/types.ts": express })).toEqual([])
+    expect(findingsWith({ ...inDevelopment, "apps/web/src/types.ts": express }, asValues)).toEqual(["undeclared-import express"])
+    expect(findingsWith({ ...inShipped, "apps/web/src/types.ts": express }, asValues)).toEqual([])
+  })
+
+  it("judges every type-only form, not only import type", () => {
+    for (const source of [
+      'export type * from "bun"\n',
+      'export type S = import("bun").Socket\n',
+      'declare module "bun" {\n  interface Env {\n    readonly x: string\n  }\n}\n',
+      'import type B = require("bun")\nexport type S = B.Socket\n',
+    ]) {
+      expect(findingsWith({ [service]: source }), source).toEqual([])
+      expect(findingsWith({ [service]: source }, asValues), source).toEqual(["runtime-module bun"])
+    }
+  })
+
+  it("judges a runtime's types package as the runtime, never as an outside package", () => {
+    for (const [source, target] of [
+      ['/// <reference types="node" />\nexport {}\n', "node"],
+      ['/// <reference types="bun-types" />\nexport {}\n', "bun-types"],
+      ['import type { DurableObjectState } from "@cloudflare/workers-types"\nexport type S = DurableObjectState\n', "@cloudflare/workers-types"],
+    ] as const) {
+      expect(findingsWith({ [library]: source }, asValues), source).toEqual([`runtime-module ${target}`])
+      // A kind that may use runtime modules may reference their types, declared or not.
+      expect(findingsWith({ "platforms/cloudflare/src/types.ts": source }, asValues), source).toEqual([])
+    }
+  })
+
+  it("maps a types package's subpaths too, and judges a value import of one as an outside package", () => {
+    expect(findingsWith({ [library]: 'import type { Expect } from "bun-types/test"\nexport type E = Expect\n' }, asValues)).toEqual([
+      "runtime-module bun-types/test",
+    ])
+    expect(findingsWith({ [library]: 'import "bun-types"\n' })).toEqual(["forbidden-external bun-types", "undeclared-import bun-types"])
+  })
+
+  it("counts Node's types as Node when the configuration names Node only by its bare built-ins", () => {
+    const bareOnly: Config = { ...asValues, runtimeModules: { prefixes: ["bun:", "cloudflare:"], names: ["bun", "fs"] } }
+    const source = '/// <reference types="node" />\nexport {}\n'
+    expect(findingsWith({ [library]: source }, bareOnly)).toEqual(["runtime-module node"])
+    expect(findingsWith({ "platforms/cloudflare/src/types.ts": source }, bareOnly)).toEqual([])
+  })
+
+  it("keeps typeOnlyUses and development files as they were", () => {
+    const config: Config = { ...asValues, packages: { ...validConfig.packages, "@acme/web": { typeOnlyUses: ["@acme/service-room"] } } }
+    const manifest = { "apps/web/package.json": { name: "@acme/web", dependencies: { "@acme/parcel": "workspace:*", "@acme/service-room": "workspace:*" } } }
+    expect(findingsWith({ ...manifest, "apps/web/src/types.ts": 'import type { Room } from "@acme/service-room"\nexport type R = Room\n' }, config)).toEqual([])
+    expect(findingsWith({ "services/room/test/socket.test.ts": bunTypes }, asValues)).toEqual([])
+  })
+})
