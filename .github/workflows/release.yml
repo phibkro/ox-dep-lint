@@ -1,6 +1,7 @@
-# Publishes to npm when a version tag is pushed. The `release` environment only admits `v*` tags, so only this job can
-# read its NPM_TOKEN. Once the package exists, npm's trusted publishing (OIDC, `id-token: write`) replaces the token:
-# configure repository phibkro/ox-dep-lint, workflow release.yml, environment release on npmjs.com, then delete the secret.
+# Publishes to npm when a version tag is pushed, through npm trusted publishing (OIDC, `id-token: write`): npmjs.com
+# trusts repository phibkro/ox-dep-lint, workflow release.yml, environment release. No token is passed, so a
+# misconfigured trusted publisher fails the job instead of falling back to a stored token. The `release` environment
+# admits only `v*` tags.
 name: release
 on:
   push:
@@ -33,5 +34,3 @@ jobs:
       - run: bun run build
       # A prerelease (0.2.0-beta.1) goes to the `next` dist-tag, so `latest` only ever names a release.
       - run: npm publish --provenance --access public --tag "$(case "$GITHUB_REF_NAME" in *-*) echo next ;; *) echo latest ;; esac)"
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
