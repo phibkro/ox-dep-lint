@@ -1,6 +1,6 @@
 {
   "name": "ox-dep-lint",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Module dependency graph rules for oxlint: package kinds, outside packages, runtime and test-only modules, undeclared, escaping and computed imports",
   "license": "MIT",
   "author": "Philip B. Krogh",
@@ -9,12 +9,13 @@
     "url": "git+https://github.com/phibkro/ox-dep-lint.git"
   },
   "bin": {
-    "ox-dep-lint": "./dist/cli.mjs"
+    "ox-dep-lint": "dist/cli.mjs"
   },
   "files": [
     "dist",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "CHANGELOG.md"
   ],
   "type": "module",
   "exports": {
