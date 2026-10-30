@@ -41,16 +41,17 @@ jobs:
       # (the event's base.sha can lag behind main after `edited` or `reopened`).
       - name: A changeset says how this changes the version (bunx changeset, or bunx changeset --empty)
         run: |
-          added=$(git diff --name-only --diff-filter=A HEAD^1 HEAD -- .changeset | grep -v '^.changeset/README.md$' | grep '\.md$' || true)
+          # Only the top level: changesets reads no subdirectories.
+          added=$(git diff --name-only --diff-filter=A HEAD^1 HEAD -- .changeset | grep -E '^\.changeset/[^/]+\.md$' | grep -v '^.changeset/README.md$' || true)
           if [ -z "$added" ]; then
             echo "::error::this pull request adds no changeset: run bunx changeset (patch, minor or major) or bunx changeset --empty"
             exit 1
           fi
           echo "$added"
-      - name: The changesets version cleanly (what the version workflow runs on main)
+      - name: The changesets version cleanly (the same commands the version workflow runs on main)
         run: |
           bunx --no-install changeset version
-          bunx --no-install vp fmt --check CHANGELOG.md package.json
+          bunx --no-install vp fmt CHANGELOG.md package.json
           git checkout -q -- . && git clean -fdq .changeset
       - name: Every commit is a Conventional Commit
         run: bunx --no-install commitlint --from HEAD^1 --to HEAD^2 --verbose
