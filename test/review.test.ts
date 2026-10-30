@@ -173,7 +173,7 @@ describe("workspace and configuration robustness (review findings 10, 16 and 18)
     for (const field of dependencyFields) {
       for (const value of ["some string", ["oops"], 1, true, null]) {
         expect(findingsWith({ "tools/extra/package.json": { name: "@acme/extra", [field]: value } }), `${field}: ${JSON.stringify(value)}`).toEqual([
-          "invalid-package tools/extra",
+          `invalid-package tools/extra#${field}`,
         ])
       }
     }
@@ -181,7 +181,7 @@ describe("workspace and configuration robustness (review findings 10, 16 and 18)
 
   it("still checks a member whose dependency field is not an object, as declaring nothing in that field", () => {
     expect(findingsWith({ "apps/web/package.json": { name: "@acme/web", dependencies: "@acme/parcel" } })).toEqual([
-      "invalid-package apps/web",
+      "invalid-package apps/web#dependencies",
       "undeclared-import @acme/parcel",
     ])
   })
@@ -197,6 +197,37 @@ describe("workspace and configuration robustness (review findings 10, 16 and 18)
     } finally {
       removeWorkspace(root)
     }
+  })
+
+  it("baselines a field by its own target, so the entry cannot hide a later unreadable or nameless package.json", () => {
+    const quality = validWorkspace["tools/quality/package.json"] as object
+    const root = writeWorkspace({ ...validWorkspace, "tools/quality/package.json": { ...quality, peerDependencies: [] } })
+    const config: Config = {
+      ...validConfig,
+      baseline: [{ file: "tools/quality/package.json", rule: "invalid-package", target: "tools/quality#peerDependencies", reason: "fixed upstream" }],
+    }
+    const findings = () => checkWorkspace(root, config).findings.map((finding) => `${finding.rule} ${finding.file} ${finding.target ?? ""}`)
+
+    try {
+      expect(findings()).toEqual([])
+      writeFileSync(nodePath.join(root, "tools/quality/package.json"), '{ "name": "@acme/tool-quality", ')
+      expect(findings()).toEqual(["invalid-package tools/quality/package.json tools/quality", "stale-baseline tools/quality/package.json invalid-package"])
+      writeFileSync(nodePath.join(root, "tools/quality/package.json"), JSON.stringify({ peerDependencies: [] }))
+      expect(findings()).toEqual(["invalid-package tools/quality/package.json tools/quality", "stale-baseline tools/quality/package.json invalid-package"])
+    } finally {
+      removeWorkspace(root)
+    }
+  })
+
+  it("negative control: an entry for the member's directory does not cover a field's finding", () => {
+    const config: Config = {
+      ...validConfig,
+      baseline: [{ file: "tools/extra/package.json", rule: "invalid-package", target: "tools/extra", reason: "the whole member" }],
+    }
+    expect(findingsWith({ "tools/extra/package.json": { name: "@acme/extra", dependencies: "some string" } }, config)).toEqual([
+      "invalid-package tools/extra#dependencies",
+      "stale-baseline invalid-package",
+    ])
   })
 
   it("negative control: dependency fields that are objects, empty or absent, are no finding", () => {

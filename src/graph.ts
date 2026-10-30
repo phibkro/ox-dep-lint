@@ -31,7 +31,10 @@ export const graphFindings = (engine: Engine): Finding[] => {
   const at = { line: 1, column: 0 }
 
   for (const problem of workspace.problems) {
-    findings.push({ rule: "invalid-package", file: `${problem.directory}/package.json`, ...at, message: problem.message, target: problem.directory })
+    // A field's finding has its own target (`tools/quality#peerDependencies`), so a baseline entry for it cannot also
+    // cover a package.json that later cannot be read or loses its name, which drops the member from the check.
+    const target = problem.field === undefined ? problem.directory : `${problem.directory}#${problem.field}`
+    findings.push({ rule: "invalid-package", file: `${problem.directory}/package.json`, ...at, message: problem.message, target })
   }
 
   // A directory a kind names, with a package.json, that the workspace leaves out would otherwise go unchecked.

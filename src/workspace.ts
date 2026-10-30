@@ -29,9 +29,9 @@ export interface Workspace {
   /**
    * Members whose package.json is wrong. With no name, a name another member has, or a package.json that cannot be read,
    * the member cannot be checked and is not in `packages`; with a dependency field that is not an object, it is, as if
-   * that field declared nothing.
+   * that field declared nothing, and `field` names it.
    */
-  readonly problems: readonly { readonly directory: string; readonly message: string }[]
+  readonly problems: readonly { readonly directory: string; readonly message: string; readonly field?: ManifestField }[]
   /** The root package.json's `workspaces` globs, negations (`!apps/old`) included. */
   readonly globs: readonly string[]
 }
@@ -81,14 +81,14 @@ const namesOf = (field: unknown): readonly string[] => (isRecord(field) ? Object
  * A message for each dependency field of `manifest` that is present and not an object (`"dependencies": "x"`, a list, a
  * number, null). Such a field declares nothing the check can read, so without a finding its edges would pass unseen.
  */
-const malformedFields = (manifest: Manifest): string[] =>
+const malformedFields = (manifest: Manifest): { readonly field: ManifestField; readonly message: string }[] =>
   allManifestFields
     .filter((field) => manifest[field] !== undefined && !isRecord(manifest[field]))
     .map((field) => {
       const value = manifest[field]
       const described = value === null ? "null" : Array.isArray(value) ? "a list" : `a ${typeof value}`
 
-      return `${field} is ${described}, not an object of package names to version ranges, so no dependency in it is read`
+      return { field, message: `${field} is ${described}, not an object of package names to version ranges, so no dependency in it is read` }
     })
 
 const fieldsOf = (manifest: Manifest): Record<ManifestField, readonly string[]> => ({
@@ -308,7 +308,7 @@ export const loadWorkspace = (root: string): Workspace => {
   }
 
   const packages: WorkspacePackage[] = []
-  const problems: { directory: string; message: string }[] = []
+  const problems: { directory: string; message: string; field?: ManifestField }[] = []
   const byName = new Map<string, WorkspacePackage>()
 
   for (const directory of [...directories].toSorted()) {
@@ -338,8 +338,8 @@ export const loadWorkspace = (root: string): Workspace => {
       continue
     }
 
-    for (const message of malformedFields(manifest)) {
-      problems.push({ directory, message })
+    for (const { field, message } of malformedFields(manifest)) {
+      problems.push({ directory, message, field })
     }
 
     const entry = { name: manifest.name, directory, manifest: fieldsOf(manifest), aliases: aliasesOf(manifest) }
