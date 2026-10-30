@@ -1,14 +1,12 @@
 import { builtinModules } from "node:module"
 import * as v from "valibot"
 
-const filePolicySchema = v.picklist(["shipped", "development", "unchecked"])
-
 /**
  * How a file is checked. `shipped`: every rule. `development` (tests, scripts, fixtures): kind edges, relative imports
  * and unresolved imports are still checked, but devDependencies, test-only specifiers, runtime modules, outside
  * packages and computed `import()` are allowed. `unchecked`: not read at all.
  */
-export type FilePolicy = v.InferOutput<typeof filePolicySchema>
+export type FilePolicy = "shipped" | "development" | "unchecked"
 
 /** One kind of package (a layer of the workspace): which packages it holds and what they may import. */
 export interface KindRule {
@@ -64,9 +62,7 @@ export const ruleNames = [
   "parse-error",
 ] as const
 
-const ruleNameSchema = v.picklist(ruleNames)
-
-export type RuleName = v.InferOutput<typeof ruleNameSchema>
+export type RuleName = (typeof ruleNames)[number]
 
 /** A finding the repository tolerates for now. The check fails when no finding needs it any more, so the list shrinks. */
 export interface BaselineEntry {
@@ -78,26 +74,15 @@ export interface BaselineEntry {
   readonly reason: string
 }
 
-const manifestFieldSchema = v.picklist(["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"])
-
-export type ManifestField = v.InferOutput<typeof manifestFieldSchema>
-
-/** The values each import policy may take. */
-const policies = {
-  computed: v.picklist(["error-in-shipped", "error", "allow"]),
-  selfByName: v.picklist(["error", "allow"]),
-  unresolved: v.picklist(["error", "ignore"]),
-  requireDeclared: v.boolean(),
-  typeOnly: v.picklist(["relaxed", "as-values"]),
-}
+export type ManifestField = "dependencies" | "devDependencies" | "optionalDependencies" | "peerDependencies"
 
 export interface ImportPolicy {
   /** `import(expression)`, an escaped literal, `createRequire`: an error in shipped code (default), everywhere, or never. */
-  readonly computed?: v.InferOutput<typeof policies.computed>
+  readonly computed?: "error-in-shipped" | "error" | "allow"
   /** A package importing itself by its own name. Default `"allow"`. */
-  readonly selfByName?: v.InferOutput<typeof policies.selfByName>
+  readonly selfByName?: "error" | "allow"
   /** A relative path or alias that names no file. Default `"error"`. */
-  readonly unresolved?: v.InferOutput<typeof policies.unresolved>
+  readonly unresolved?: "error" | "ignore"
   /** Which `package.json` fields count as edges between workspace packages. Default all four. */
   readonly manifestEdgeFields?: readonly ManifestField[]
   /**
@@ -116,7 +101,7 @@ export interface ImportPolicy {
    * devDependencies declare them. `"as-values"`: judged like value imports, for kinds whose public types must not name
    * a runtime or vendor either. Kind edges and `typeOnlyUses` always see the real form.
    */
-  readonly typeOnly?: v.InferOutput<typeof policies.typeOnly>
+  readonly typeOnly?: "relaxed" | "as-values"
 }
 
 export interface Config {
@@ -166,7 +151,7 @@ export const defaultFileClasses: readonly FileClass[] = [
 /** Build output and coverage reports under a package, never read unless `output` says otherwise. */
 export const defaultOutput: readonly string[] = ["dist/**", "coverage/**"]
 
-const allManifestFields: readonly ManifestField[] = manifestFieldSchema.options
+const allManifestFields: readonly ManifestField[] = ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"]
 
 /** Identity, for type checking a configuration file. */
 export const defineConfig = (config: Config): Config => config
@@ -181,7 +166,45 @@ const isPlainObject = (value: unknown): value is Record<string, unknown> => type
 
 const plainObject = v.custom<Record<string, unknown>>(isPlainObject)
 
-const stringList = v.array(v.string())
+/**
+ * Whether two types are the same, not merely assignable. The public types are written out by hand, so the emitted
+ * declarations never name valibot; `schemaOf` ties each one to its schema at compile time instead.
+ */
+type Same<Left, Right> = (<Probe>() => Probe extends Left ? 1 : 2) extends <Probe>() => Probe extends Right ? 1 : 2 ? true : false
+
+/** `schema` itself, which fails to type check unless it accepts exactly `Output`. */
+const schemaOf =
+  <Output>() =>
+  <Schema extends v.GenericSchema>(schema: Schema & (Same<v.InferOutput<Schema>, Output> extends true ? unknown : never)): Schema =>
+    schema
+
+const filePolicySchema = schemaOf<FilePolicy>()(v.picklist(["shipped", "development", "unchecked"]))
+const manifestFieldSchema = schemaOf<ManifestField>()(v.picklist(allManifestFields))
+const ruleNameSchema = schemaOf<RuleName>()(v.picklist(ruleNames))
+
+/** The values each import policy may take. */
+const policies = {
+  computed: schemaOf<NonNullable<ImportPolicy["computed"]>>()(v.picklist(["error-in-shipped", "error", "allow"])),
+  selfByName: schemaOf<NonNullable<ImportPolicy["selfByName"]>>()(v.picklist(["error", "allow"])),
+  unresolved: schemaOf<NonNullable<ImportPolicy["unresolved"]>>()(v.picklist(["error", "ignore"])),
+  requireDeclared: schemaOf<NonNullable<ImportPolicy["requireDeclared"]>>()(v.boolean()),
+  typeOnly: schemaOf<NonNullable<ImportPolicy["typeOnly"]>>()(v.picklist(["relaxed", "as-values"])),
+}
+
+/** 0.2's test for a list of strings. `every` skips the holes of a sparse array, where `v.array` reads `undefined`. */
+const isStringList = (value: unknown): value is readonly string[] => Array.isArray(value) && value.every((item) => typeof item === "string")
+
+const stringList = v.custom<readonly string[]>(isStringList)
+
+/** A list of manifest fields, holes skipped as in 0.2. */
+const manifestFieldList = v.custom<readonly ManifestField[]>((value) => isStringList(value) && value.every((field) => v.is(manifestFieldSchema, field)))
+
+/**
+ * A value in a message, written as 0.2 wrote it: a template literal, which throws for a Symbol. 0.2 threw that way
+ * (exit 2 with the TypeError's message), so the check still does.
+ */
+// SAFETY: the cast only satisfies the template's type; the conversion is the template's own, as in 0.2.
+const asText = (value: unknown): string => `${value as string}`
 
 /**
  * Every own entry of an object, each value checked by `value`. Not `v.record`, which skips the keys `constructor`,
@@ -194,6 +217,9 @@ const ownEntries = <Value extends v.GenericSchema>(value: Value) =>
     v.array(v.tuple([v.string(), value])),
   )
 
+/** 0.2's outline test for a list of objects, which skips holes as `every` does. */
+const objectList = v.custom<readonly Record<string, unknown>[]>((value) => Array.isArray(value) && value.every(isPlainObject))
+
 /** The outline (objects where objects belong, lists where lists belong), checked first: nothing else is read until it holds. */
 const outlineSchema = v.pipe(
   plainObject,
@@ -202,8 +228,8 @@ const outlineSchema = v.pipe(
     packages: v.optional(ownEntries(plainObject)),
     imports: v.optional(plainObject),
     runtimeModules: v.optional(plainObject),
-    fileClasses: v.optional(v.array(plainObject)),
-    baseline: v.optional(v.array(plainObject)),
+    fileClasses: v.optional(objectList),
+    baseline: v.optional(objectList),
   }),
 )
 
@@ -234,14 +260,14 @@ const importPolicySchema = v.strictObject({
   computed: v.optional(policies.computed),
   selfByName: v.optional(policies.selfByName),
   unresolved: v.optional(policies.unresolved),
-  manifestEdgeFields: v.optional(v.array(manifestFieldSchema)),
+  manifestEdgeFields: v.optional(manifestFieldList),
   requireDeclared: v.optional(policies.requireDeclared),
-  shippedFields: v.optional(v.array(manifestFieldSchema)),
+  shippedFields: v.optional(manifestFieldList),
   typeOnly: v.optional(policies.typeOnly),
 })
 
 const baselineEntrySchema = v.strictObject({
-  // Not checked, as in 0.2; the messages name it as written.
+  // Not checked, as in 0.2, beyond being written into messages (where a Symbol throws, as it did in 0.2).
   file: v.optional(v.unknown()),
   rule: ruleNameSchema,
   target: v.pipe(v.string(), v.nonEmpty()),
@@ -379,19 +405,27 @@ const kindProblems = (path: readonly PathItem[], unknownKey: boolean, holder: Re
 /** The kinds a kind may use that are not kinds: a reference across entries, which no schema of one entry sees. */
 const kindReferenceProblems = (kinds: Record<string, unknown>): Problem[] => {
   const known = new Set(Object.keys(kinds))
+  const problems: Problem[] = []
 
-  return Object.values(kinds).flatMap((kind, index) => {
+  for (const [index, [name, kind]] of Object.entries(kinds).entries()) {
     const mayUse: unknown = isPlainObject(kind) ? kind.mayUse : undefined
-    const name = Object.keys(kinds)[index] ?? ""
 
-    return Array.isArray(mayUse)
-      ? mayUse.flatMap((used: unknown, position) =>
-          typeof used === "string" && known.has(used)
-            ? []
-            : [{ order: [section.kinds, index, kindFieldOrder.length + 1, position], message: `kind ${name} may use ${String(used)}, which is not a kind` }],
-        )
-      : []
-  })
+    if (!Array.isArray(mayUse)) {
+      continue
+    }
+
+    // for...of, as in 0.2: a hole of a sparse list is read as undefined, which is not a kind.
+    for (const [position, used] of [...(mayUse as unknown[])].entries()) {
+      if (typeof used !== "string" || !known.has(used)) {
+        problems.push({
+          order: [section.kinds, index, kindFieldOrder.length + 1, position],
+          message: `kind ${name} may use ${asText(used)}, which is not a kind`,
+        })
+      }
+    }
+  }
+
+  return problems
 }
 
 const packageProblems = (path: readonly PathItem[], unknownKey: boolean, holder: Record<string, unknown>): Problem[] => {
@@ -460,19 +494,20 @@ const fileClassProblems = (path: readonly PathItem[], unknownKey: boolean, holde
 const baselineProblems = (path: readonly PathItem[], unknownKey: boolean, holder: Record<string, unknown>): Problem[] => {
   const index = Number(path[1]?.key)
   const entry = objectAt(path, 1)
-  const [file, rule] = [String(entry.file), String(entry.rule)]
+  const file = asText(entry.file)
 
   if (unknownKey) {
     return unknownKeyProblems(`the baseline entry for ${file}`, holder, baselineEntrySchema.entries, [section.baseline, index, 0])
   }
 
   const field = String(path[2]?.key)
-  const messages: Readonly<Record<string, string>> = {
-    rule: `the baseline entry for ${file} names the unknown rule ${rule}`,
-    target: `the baseline entry for ${rule} in ${file} names no target, so it would hide every future finding of that rule there`,
-    reason: `the baseline entry for ${rule} in ${file} has no reason`,
+  // Built only for the field at fault: 0.2 wrote the rule with a template literal in two of them and with String in one.
+  const messages: Readonly<Record<string, () => string>> = {
+    rule: () => `the baseline entry for ${file} names the unknown rule ${String(entry.rule)}`,
+    target: () => `the baseline entry for ${asText(entry.rule)} in ${file} names no target, so it would hide every future finding of that rule there`,
+    reason: () => `the baseline entry for ${asText(entry.rule)} in ${file} has no reason`,
   }
-  const message = messages[field]
+  const message = messages[field]?.()
 
   return message === undefined ? [] : [{ order: [section.baseline, index, baselineFieldOrder.indexOf(field)], message }]
 }
@@ -551,6 +586,19 @@ export const configProblems = (config: Config): string[] => {
 
   if (!outline.success) {
     return [...new Set(outline.issues.map((issue) => outlineMessage(issue.path ?? [])))]
+  }
+
+  // 0.2's outline skipped the holes of a sparse fileClasses or baseline, and then crashed on them. A hole is reported
+  // instead, alone, as 0.2 reported nothing else once it crashed.
+  const sparse = (["fileClasses", "baseline"] as const).filter((key) => [...(config[key] ?? [])].includes(undefined as never))
+
+  if (sparse.length > 0) {
+    return sparse.map((key) => `${key} must be a list of objects`)
+  }
+
+  // 0.2 named every baseline entry's file in a message before checking the entry, so a Symbol there throws here too.
+  for (const entry of config.baseline ?? []) {
+    asText(entry.file)
   }
 
   const checked = v.safeParse(configSchema, config)
