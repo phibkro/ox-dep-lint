@@ -1,13 +1,16 @@
 /**
  * Checks that need the whole workspace rather than one file: edges declared only in `package.json`, cycles between
- * packages, packages no kind holds, and baseline entries no finding needs any more. Only the CLI runs these, because an
- * oxlint plugin sees one file at a time and never sees `package.json`.
+ * packages, packages no kind holds, directories the workspaces match that no package owns, and baseline entries no
+ * finding needs any more. Only the CLI runs these, because an oxlint plugin sees one file at a time and never sees
+ * `package.json`.
  */
-import { existsSync } from "node:fs"
+import { existsSync, readdirSync, statSync } from "node:fs"
 import nodePath from "node:path"
 import type { ManifestField } from "./config.ts"
-import { baselineCovers, edgeRefusal } from "./engine.ts"
+import { baselineCovers, edgeRefusal, ignoresDirectory, linkDestination, symbolicLinkFinding, unreadableDirectoryFinding } from "./engine.ts"
 import type { Engine, Finding } from "./engine.ts"
+import { matchesGlob } from "./glob.ts"
+import { codeOf } from "./result.ts"
 import { directoriesMatching } from "./workspace.ts"
 
 const runtimeFields: readonly ManifestField[] = ["dependencies", "optionalDependencies", "peerDependencies"]
@@ -40,6 +43,8 @@ export const graphFindings = (engine: Engine): Finding[] => {
       }
     }
   }
+
+  findings.push(...directoriesWithoutPackage(engine, members))
 
   for (const entry of workspace.packages) {
     const manifest = `${entry.directory}/package.json`
@@ -107,6 +112,94 @@ export const graphFindings = (engine: Engine): Finding[] => {
   findings.push(...packageCycles(engine))
 
   return findings
+}
+
+const isDirectory = (absolute: string): boolean => {
+  try {
+    return statSync(absolute).isDirectory()
+  } catch {
+    return false
+  }
+}
+
+/** Whether `absolute`, links followed, is something other than a directory; false when nothing is there. */
+const isFile = (absolute: string): boolean => {
+  try {
+    return !statSync(absolute).isDirectory()
+  } catch {
+    return false
+  }
+}
+
+/** The error code of a directory that cannot be listed, or undefined when it can. */
+const unreadable = (absolute: string): string | undefined => {
+  try {
+    readdirSync(absolute)
+
+    return undefined
+  } catch (cause) {
+    return codeOf(cause)
+  }
+}
+
+/**
+ * What the root's `workspaces` globs match that is no package: a directory without a `package.json` (or one that cannot
+ * be read), whose files no package owns and so nothing checks, and a symbolic link, which is never followed. A directory
+ * inside or above a member (under `packages/**`), one a negated glob leaves out, and one `ignore` covers are not
+ * reported.
+ */
+const directoriesWithoutPackage = (engine: Engine, members: ReadonlySet<string>): Finding[] => {
+  const { workspace } = engine
+  const negated = workspace.globs.filter((glob) => glob.startsWith("!")).map((glob) => glob.slice(1).replace(/^\.\//u, ""))
+  const related = (directory: string) =>
+    [...members].some((member) => member === directory || member.startsWith(`${directory}/`) || directory.startsWith(`${member}/`))
+  const findings = new Map<string, Finding>()
+
+  for (const glob of workspace.globs.filter((pattern) => !pattern.startsWith("!"))) {
+    const links: string[] = []
+
+    for (const directory of directoriesMatching(workspace.root, glob, links)) {
+      if (
+        findings.has(directory) ||
+        related(directory) ||
+        !isDirectory(nodePath.join(workspace.root, directory)) ||
+        negated.some((pattern) => matchesGlob(directory, pattern)) ||
+        ignoresDirectory(engine, directory)
+      ) {
+        continue
+      }
+
+      const code = unreadable(nodePath.join(workspace.root, directory))
+
+      findings.set(
+        directory,
+        code === undefined
+          ? {
+              rule: "directory-without-package",
+              file: directory,
+              line: 1,
+              column: 0,
+              message: `${directory} matches the workspaces glob ${glob} but has no package.json, so no package owns what it holds and nothing in it is checked: make it a package, remove it, or add ${directory}/** to ignore`,
+              target: directory,
+            }
+          : unreadableDirectoryFinding(directory, code),
+      )
+    }
+
+    // A link to a file is no package, as a file there is none; a link to a directory, or to nothing, may be one.
+    for (const link of links) {
+      if (
+        !findings.has(link) &&
+        !isFile(nodePath.join(workspace.root, link)) &&
+        !negated.some((pattern) => matchesGlob(link, pattern)) &&
+        !ignoresDirectory(engine, link)
+      ) {
+        findings.set(link, symbolicLinkFinding(link, linkDestination(nodePath.join(workspace.root, link))))
+      }
+    }
+  }
+
+  return [...findings.values()].toSorted((left, right) => left.file.localeCompare(right.file))
 }
 
 /** A directed graph's strongly connected components, and the cycle routes the search behind them closes. */

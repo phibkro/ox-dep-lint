@@ -1,5 +1,5 @@
-export { checkWorkspace, formatFinding, listSourceFiles } from "./check.ts"
-export type { CheckResult } from "./check.ts"
+export { checkWorkspace, formatFinding, listSourceFiles, walkSources } from "./check.ts"
+export type { CheckResult, SourceWalk } from "./check.ts"
 export { configProblems, defaultFileClasses, defineConfig, resolveConfig } from "./config.ts"
 export type { BaselineEntry, Config, FileClass, FilePolicy, ImportPolicy, KindRule, ManifestField, PackageRule, ResolvedConfig, RuleName } from "./config.ts"
 export { createEngine, effectivePolicy, findingsForFile, policyOf, reads, withoutBaselined } from "./engine.ts"

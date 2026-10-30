@@ -27,6 +27,8 @@ export interface Workspace {
   readonly rootManifest: Readonly<Record<ManifestField, readonly string[]>>
   /** Members that cannot be checked: no name, a name another member has, an unreadable package.json. */
   readonly problems: readonly { readonly directory: string; readonly message: string }[]
+  /** The root package.json's `workspaces` globs, negations (`!apps/old`) included. */
+  readonly globs: readonly string[]
 }
 
 interface Manifest {
@@ -144,7 +146,11 @@ export const findWorkspaceRoot = (start: string): string | undefined => {
   }
 }
 
-export const directoriesMatching = (root: string, pattern: string): string[] => {
+/**
+ * The directories under `root` that `pattern` matches, skipping `node_modules` and dot directories. A symbolic link is
+ * never followed; with `links`, each one the pattern matches is collected there.
+ */
+export const directoriesMatching = (root: string, pattern: string, links?: string[]): string[] => {
   const negated = pattern.startsWith("!")
   const clean = (negated ? pattern.slice(1) : pattern).replace(/^\.\//u, "").replace(/\/$/u, "")
   const fixed: string[] = []
@@ -173,8 +179,12 @@ export const directoriesMatching = (root: string, pattern: string): string[] => 
     const absolute = nodePath.join(root, relative)
 
     for (const entry of readdirSync(absolute, { withFileTypes: true })) {
+      const path = relative === "" ? entry.name : `${relative}/${entry.name}`
+
       if (entry.isDirectory() && entry.name !== "node_modules" && !entry.name.startsWith(".")) {
-        walk(relative === "" ? entry.name : `${relative}/${entry.name}`, depth + 1)
+        walk(path, depth + 1)
+      } else if (entry.isSymbolicLink() && links !== undefined && matchesGlob(path, clean)) {
+        links.push(path)
       }
     }
   }
@@ -248,7 +258,7 @@ export const loadWorkspace = (root: string): Workspace => {
     byName.set(entry.name, entry)
   }
 
-  return { root, packages, byName, rootManifest: fieldsOf(rootManifest), problems }
+  return { root, packages, byName, rootManifest: fieldsOf(rootManifest), problems, globs }
 }
 
 /** The package whose directory holds the repository-relative `file`, the deepest one when packages nest. */

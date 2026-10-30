@@ -3,12 +3,12 @@
  * it over every file and adds the whole-graph checks (`graph.ts`), so the two never disagree. Rules adapted from the
  * module graph checks of phibkro/file-transfer, phibkro/vektorprogrammet-reimagined and reebeat/reebeat.
  */
-import { readFileSync, statSync } from "node:fs"
+import { lstatSync, readFileSync, readlinkSync, statSync } from "node:fs"
 import { builtinModules } from "node:module"
 import nodePath from "node:path"
 import { resolveConfig } from "./config.ts"
 import type { BaselineEntry, Config, FilePolicy, ManifestField, ResolvedConfig, RuleName } from "./config.ts"
-import { matchesAny } from "./glob.ts"
+import { matchesAny, matchesGlob } from "./glob.ts"
 import { isRuntimeModule, makeResolver, withoutQuery } from "./resolve.ts"
 import type { Resolver, Target } from "./resolve.ts"
 import { importForms } from "./specifiers.ts"
@@ -151,6 +151,145 @@ export const reads = (engine: Engine, file: string): boolean => {
   return owner !== undefined && !matchesAny(file.slice(owner.directory.length + 1), engine.config.output)
 }
 
+/** Whether `glob` matches every path under `directory`: it is `**`, or it or a directory above it matches what comes before a trailing `/**`. */
+const coversDirectory = (glob: string, directory: string): boolean => {
+  if (glob === "**") {
+    return true
+  }
+
+  if (!glob.endsWith("/**") || directory === "") {
+    return false
+  }
+
+  const parts = directory.split("/")
+
+  return parts.some((_, index) => matchesGlob(parts.slice(0, index + 1).join("/"), glob.slice(0, -3)))
+}
+
+/**
+ * Whether `glob` might match a path under `directory`: its leading segments agree with the directory's until a `**`,
+ * and it is longer than the directory. A glob with braces is taken to match, so a doubt counts as a match.
+ */
+const mayMatchUnder = (glob: string, directory: string): boolean => {
+  if (glob.includes("{")) {
+    return true
+  }
+
+  const globParts = glob.split("/")
+  const directoryParts = directory === "" ? [] : directory.split("/")
+
+  for (const [index, part] of directoryParts.entries()) {
+    const globPart = globParts[index]
+
+    if (globPart === undefined) {
+      return false
+    }
+
+    if (globPart === "**") {
+      return true
+    }
+
+    if (!matchesGlob(part, globPart)) {
+      return false
+    }
+  }
+
+  return globParts.length > directoryParts.length
+}
+
+/** Whether an `ignore` glob covers every file under the repository-relative `directory`. */
+export const ignoresDirectory = (engine: Engine, directory: string): boolean => engine.config.ignore.some((glob) => coversDirectory(glob, directory))
+
+/**
+ * Whether the check reads no file under the repository-relative `directory`, so a symbolic link or an unreadable
+ * directory there hides nothing: an `ignore` glob covers it, or (relative to the package that owns it) an `output` glob
+ * or an unchecked file class does, with no earlier class that might match a file in it. A glob covers a directory only
+ * through a trailing `/**`; any doubt counts as read, so the answer errs towards a finding.
+ */
+export const skipsDirectory = (engine: Engine, directory: string): boolean => {
+  const { config } = engine
+
+  if (ignoresDirectory(engine, directory)) {
+    return true
+  }
+
+  const owner = packageOfFile(engine.workspace, `${directory}/`)
+
+  if (owner === undefined) {
+    return true
+  }
+
+  const relative = directory.slice(owner.directory.length + 1)
+
+  if (config.output.some((glob) => coversDirectory(glob, relative))) {
+    return true
+  }
+
+  for (const fileClass of config.fileClasses) {
+    if (fileClass.files.some((glob) => coversDirectory(glob, relative))) {
+      return fileClass.policy === "unchecked"
+    }
+
+    if (fileClass.policy !== "unchecked" && fileClass.files.some((glob) => mayMatchUnder(glob, relative))) {
+      return false
+    }
+  }
+
+  return false
+}
+
+/** A symbolic link the check met and did not follow, at `path` (repository-relative), with the destination it names. */
+export const symbolicLinkFinding = (path: string, destination: string): Finding => ({
+  rule: "symbolic-link",
+  file: path,
+  line: 1,
+  column: 0,
+  message: `${path} is a symbolic link to ${destination}, which the check never follows, so what it reaches goes unchecked: replace it with the files themselves, or baseline it`,
+  target: destination,
+})
+
+/** A directory the check needed to read and could not, with the error code that said why. */
+export const unreadableDirectoryFinding = (directory: string, code: string): Finding => ({
+  rule: "unreadable-directory",
+  file: directory,
+  line: 1,
+  column: 0,
+  message: `${directory} cannot be read (${code}), so the files in it cannot be checked: make it readable, or add ${directory}/** to ignore`,
+  target: directory,
+})
+
+/** The destination a symbolic link names, as written. */
+export const linkDestination = (absolute: string): string => {
+  try {
+    return readlinkSync(absolute)
+  } catch {
+    return "an unreadable destination"
+  }
+}
+
+/**
+ * The first symbolic link on the way from `owner`'s directory down to `file` (both repository-relative), the file
+ * itself included. The CLI's walk never follows one, but oxlint does, and lints the files behind it under the link's
+ * path.
+ */
+const linkOnPath = (engine: Engine, owner: WorkspacePackage, file: string): string | undefined => {
+  const parts = file.slice(owner.directory.length + 1).split("/")
+
+  for (const [index] of parts.entries()) {
+    const path = [owner.directory, ...parts.slice(0, index + 1)].join("/")
+
+    try {
+      if (lstatSync(nodePath.join(engine.workspace.root, path)).isSymbolicLink()) {
+        return path
+      }
+    } catch {
+      return undefined
+    }
+  }
+
+  return undefined
+}
+
 /** The rules that hold for shipped code and not for development files. */
 const shippedOnlyRules: ReadonlySet<RuleName> = new Set([
   "runtime-module",
@@ -242,6 +381,13 @@ export const findingsForFile = (engine: Engine, file: string, text: string, opti
 
   if (policy === "unchecked") {
     return []
+  }
+
+  // Reached through a symbolic link (only oxlint does that): the link is the finding, and nothing behind it is read.
+  const link = linkOnPath(engine, owner, file)
+
+  if (link !== undefined) {
+    return [symbolicLinkFinding(link, linkDestination(nodePath.join(workspace.root, link)))]
   }
 
   const findings: Finding[] = []

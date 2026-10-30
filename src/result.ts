@@ -16,3 +16,7 @@ export const attempt = <Value>(operation: () => Value): Result<Value, unknown> =
 
 /** The message of something thrown, which need not be an Error. */
 export const messageOf = (cause: unknown): string => (cause instanceof Error ? cause.message : String(cause))
+
+/** The error code of something thrown by `node:fs` (`EACCES`), or its message when it has none. */
+export const codeOf = (cause: unknown): string =>
+  typeof cause === "object" && cause !== null && "code" in cause && typeof cause.code === "string" ? cause.code : messageOf(cause)
