@@ -1,0 +1,57 @@
+{
+  "name": "ox-dep-lint",
+  "version": "0.1.0",
+  "description": "Module dependency graph rules for oxlint: package kinds, outside packages, runtime and test-only modules, undeclared, escaping and computed imports",
+  "license": "MIT",
+  "author": "Philip B. Krogh",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/phibkro/ox-dep-lint.git"
+  },
+  "bin": {
+    "ox-dep-lint": "./dist/cli.mjs"
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "default": "./dist/index.mjs"
+    },
+    "./plugin": {
+      "types": "./dist/plugin.d.mts",
+      "default": "./dist/plugin.mjs"
+    }
+  },
+  "scripts": {
+    "build": "vp pack",
+    "check": "vp check --deny-warnings && vp test run",
+    "test": "vp test run"
+  },
+  "dependencies": {
+    "oxc-parser": "0.153.0",
+    "oxc-resolver": "11.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "24.9.1",
+    "oxlint": "1.86.0",
+    "typescript": "7.0.2",
+    "vite-plus": "1.4.0"
+  },
+  "peerDependencies": {
+    "oxlint": ">=1.86.0"
+  },
+  "peerDependenciesMeta": {
+    "oxlint": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=22.18"
+  }
+}
