@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.5.0
+
+### Minor Changes
+
+- 57698bb: `invalid-package` now reports a workspace member whose `dependencies`, `devDependencies`, `optionalDependencies` or `peerDependencies` is not an object: a string (`"dependencies": "some string"`), a list, a number, a boolean or `null`. 0.4 read no names from such a field and said nothing, so a forbidden or undeclared edge written there passed unseen. The finding names the field and what it holds, once per field; the member is still checked, as if that field declared nothing. The root `package.json` is not judged this way.
+
+  This is a minor release rather than a patch because it can fail a check that passed on 0.4 (the rule in `.changeset/README.md`: before 1.0, a change to what the rules report is a minor bump). Fix the field, or baseline the finding by its own target, the member's directory and the field joined by `#`:
+
+  ```ts
+  baseline: [
+    {
+      file: "tools/quality/package.json",
+      rule: "invalid-package",
+      target: "tools/quality#peerDependencies",
+      reason: "...",
+    },
+  ]
+  ```
+
+  Such an entry covers only that field. If the `package.json` later cannot be read or loses its name, which drops the member from the check, that is still reported, with the directory as its target.
+
+### Patch Changes
+
+- 57698bb: A path that disappears while the check runs is skipped instead of reported as `unreadable-path`. A test that creates and removes a temporary tree inside a package while the CLI walks it (tsukuri's `tools/quality/.scan-x/...`) no longer fails the check with `ENOENT`. This covers every place the check lists, stats or reads: the walk of each package, the `workspaces` and kind globs, a member's `package.json`, a symbolic link's destination, and a development file that shipped code imports. `ENOTDIR` (a directory on the way replaced by a file) is skipped the same way. A path that exists but cannot be read (`EACCES` and every other error) is still a finding: `unreadable-path`, or `invalid-package` for a member's `package.json`, or `shipped-imports-development-file` for a development file that shipped code imports, or `symbolic-link` (to an unreadable destination) for a link, and the oxlint plugin, which shares these functions, behaves the same. The file count the CLI prints no longer includes files that disappeared.
+
 ## 0.4.0
 
 ### Minor Changes
