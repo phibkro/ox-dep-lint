@@ -13,7 +13,8 @@ name: release
 on:
   push:
     branches: [main]
-  # A rerun after a failed publish or tag; it repeats only what is missing.
+  # A rerun after a failed publish or tag; it repeats only what is missing. Use this rather than "Re-run failed jobs",
+  # which reuses the old plan.
   workflow_dispatch:
 permissions:
   contents: read
@@ -24,6 +25,7 @@ jobs:
   plan:
     runs-on: ubuntu-latest
     outputs:
+      commit: ${{ steps.plan.outputs.commit }}
       pending: ${{ steps.plan.outputs.pending }}
       publish: ${{ steps.plan.outputs.publish }}
       tag: ${{ steps.plan.outputs.tag }}
@@ -42,6 +44,8 @@ jobs:
         id: plan
         run: |
           version=$(node -p 'require("./package.json").version')
+          # Every later job works on this commit, so a pull request merged meanwhile is never released under this plan.
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           # changesets reads only the top level of .changeset/.
           if [ -n "$(find .changeset -maxdepth 1 -name '*.md' ! -name README.md -print -quit)" ]; then
@@ -65,7 +69,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: main
+          ref: ${{ needs.plan.outputs.commit }}
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
@@ -128,14 +132,11 @@ jobs:
       contents: write
       id-token: write
     steps:
+      # Exactly the commit the plan saw: what is published, checked and tagged is the merged release, never a later merge.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: main
+          ref: ${{ needs.plan.outputs.commit }}
           persist-credentials: false
-      - name: Main still holds the planned version
-        env:
-          VERSION: ${{ needs.plan.outputs.version }}
-        run: test "$(node -p 'require("./package.json").version')" = "$VERSION"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: 1.4.4
@@ -153,16 +154,23 @@ jobs:
         if: needs.plan.outputs.publish == 'true'
         env:
           VERSION: ${{ needs.plan.outputs.version }}
-        run: npm publish --provenance --access public --tag "$(case "$VERSION" in *-*) echo next ;; *) echo latest ;; esac)"
+        run: |
+          # Looked up again, so a rerun of this job after a publish that succeeded goes on to the tag.
+          if [ -n "$(npm view "ox-dep-lint@$VERSION" version 2>/dev/null)" ]; then
+            echo "$VERSION is already on npm"
+          else
+            npm publish --provenance --access public --tag "$(case "$VERSION" in *-*) echo next ;; *) echo latest ;; esac)"
+          fi
       - name: Tag the release and make a GitHub release
         if: needs.plan.outputs.tag == 'true'
         env:
           VERSION: ${{ needs.plan.outputs.version }}
+          COMMIT: ${{ needs.plan.outputs.commit }}
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
         run: |
           awk -v heading="## $VERSION" '$0 == heading { found = 1; next } found && /^## / { exit } found' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
           prerelease=$(case "$VERSION" in *-*) echo true ;; *) echo false ;; esac)
-          # The API creates the tag at this commit with the release, so no git credentials are needed.
-          gh api "repos/$REPOSITORY/releases" -f tag_name="v$VERSION" -f target_commitish="$(git rev-parse HEAD)" \
+          # The API creates the tag at the published commit with the release, so no git credentials are needed.
+          gh api "repos/$REPOSITORY/releases" -f tag_name="v$VERSION" -f target_commitish="$COMMIT" \
             -f name="v$VERSION" -F body=@"$RUNNER_TEMP/notes.md" -F prerelease="$prerelease" --jq .html_url
