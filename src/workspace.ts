@@ -4,6 +4,7 @@
  */
 import { existsSync, lstatSync, readdirSync, readFileSync, statSync } from "node:fs"
 import nodePath from "node:path"
+import { allManifestFields } from "./config.ts"
 import type { ManifestField } from "./config.ts"
 import { matchesGlob } from "./glob.ts"
 import { attempt, codeOf, failure, messageOf, success, vanished } from "./result.ts"
@@ -25,7 +26,11 @@ export interface Workspace {
   readonly byName: ReadonlyMap<string, WorkspacePackage>
   /** The root package's own dependency fields. */
   readonly rootManifest: Readonly<Record<ManifestField, readonly string[]>>
-  /** Members that cannot be checked: no name, a name another member has, an unreadable package.json. */
+  /**
+   * Members whose package.json is wrong. With no name, a name another member has, or a package.json that cannot be read,
+   * the member cannot be checked and is not in `packages`; with a dependency field that is not an object, it is, as if
+   * that field declared nothing.
+   */
   readonly problems: readonly { readonly directory: string; readonly message: string }[]
   /** The root package.json's `workspaces` globs, negations (`!apps/old`) included. */
   readonly globs: readonly string[]
@@ -67,8 +72,24 @@ const readManifest = (path: string): Result<Manifest, ManifestFailure> => {
   return success(parsed.value)
 }
 
-const namesOf = (field: unknown): readonly string[] =>
-  typeof field === "object" && field !== null && !Array.isArray(field) ? Object.keys(field).toSorted() : []
+/** Whether a dependency field has the shape npm and Bun require: an object of package names to version ranges. */
+const isRecord = (field: unknown): field is object => typeof field === "object" && field !== null && !Array.isArray(field)
+
+const namesOf = (field: unknown): readonly string[] => (isRecord(field) ? Object.keys(field).toSorted() : [])
+
+/**
+ * A message for each dependency field of `manifest` that is present and not an object (`"dependencies": "x"`, a list, a
+ * number, null). Such a field declares nothing the check can read, so without a finding its edges would pass unseen.
+ */
+const malformedFields = (manifest: Manifest): string[] =>
+  allManifestFields
+    .filter((field) => manifest[field] !== undefined && !isRecord(manifest[field]))
+    .map((field) => {
+      const value = manifest[field]
+      const described = value === null ? "null" : Array.isArray(value) ? "a list" : `a ${typeof value}`
+
+      return `${field} is ${described}, not an object of package names to version ranges, so no dependency in it is read`
+    })
 
 const fieldsOf = (manifest: Manifest): Record<ManifestField, readonly string[]> => ({
   dependencies: namesOf(manifest.dependencies),
@@ -82,7 +103,7 @@ const aliasesOf = (manifest: Manifest): Map<string, string> => {
   const aliases = new Map<string, string>()
 
   for (const field of [manifest.dependencies, manifest.devDependencies, manifest.optionalDependencies, manifest.peerDependencies]) {
-    if (typeof field === "object" && field !== null && !Array.isArray(field)) {
+    if (isRecord(field)) {
       for (const [name, spec] of Object.entries(field)) {
         const target = typeof spec === "string" ? /^npm:(?<target>@?[^@]+)/u.exec(spec)?.groups?.target : undefined
 
@@ -315,6 +336,10 @@ export const loadWorkspace = (root: string): Workspace => {
     if (other !== undefined) {
       problems.push({ directory, message: `${manifest.name} is also the name of ${other.directory}` })
       continue
+    }
+
+    for (const message of malformedFields(manifest)) {
+      problems.push({ directory, message })
     }
 
     const entry = { name: manifest.name, directory, manifest: fieldsOf(manifest), aliases: aliasesOf(manifest) }

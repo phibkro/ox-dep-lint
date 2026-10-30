@@ -167,10 +167,44 @@ describe("workspace and configuration robustness (review findings 10, 16 and 18)
     ])
   })
 
-  it("ignores a dependencies field written as a list", () => {
-    expect(
-      findingsWith({ "apps/web/package.json": { name: "@acme/web", dependencies: { "@acme/parcel": "workspace:*" }, devDependencies: ["oops"] } }),
-    ).toEqual([])
+  const dependencyFields = ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"] as const
+
+  it("reports a dependency field that is not an object, in each of the four fields", () => {
+    for (const field of dependencyFields) {
+      for (const value of ["some string", ["oops"], 1, true, null]) {
+        expect(findingsWith({ "tools/extra/package.json": { name: "@acme/extra", [field]: value } }), `${field}: ${JSON.stringify(value)}`).toEqual([
+          "invalid-package tools/extra",
+        ])
+      }
+    }
+  })
+
+  it("still checks a member whose dependency field is not an object, as declaring nothing in that field", () => {
+    expect(findingsWith({ "apps/web/package.json": { name: "@acme/web", dependencies: "@acme/parcel" } })).toEqual([
+      "invalid-package apps/web",
+      "undeclared-import @acme/parcel",
+    ])
+  })
+
+  it("says which field is wrong and what it holds, once per field", () => {
+    const root = writeWorkspace({ ...validWorkspace, "tools/extra/package.json": { name: "@acme/extra", dependencies: "some string", peerDependencies: [] } })
+
+    try {
+      expect(checkWorkspace(root, validConfig).findings.map((finding) => `${finding.file}: ${finding.message}`)).toEqual([
+        "tools/extra/package.json: dependencies is a string, not an object of package names to version ranges, so no dependency in it is read",
+        "tools/extra/package.json: peerDependencies is a list, not an object of package names to version ranges, so no dependency in it is read",
+      ])
+    } finally {
+      removeWorkspace(root)
+    }
+  })
+
+  it("negative control: dependency fields that are objects, empty or absent, are no finding", () => {
+    for (const field of dependencyFields) {
+      expect(findingsWith({ "tools/extra/package.json": { name: "@acme/extra", [field]: {} } }), field).toEqual([])
+    }
+
+    expect(findingsWith({ "tools/extra/package.json": { name: "@acme/extra" } })).toEqual([])
   })
 
   it("refuses misspelled keys and policies, and a baseline entry without a target", () => {

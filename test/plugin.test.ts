@@ -135,3 +135,30 @@ describe("the plugin in a long-lived process", () => {
     }
   })
 })
+
+describe("the plugin and a dependency field that is not an object", () => {
+  it("keeps checking the member's files as the CLI does, and leaves invalid-package to the CLI", () => {
+    const root = writeWorkspace({ ...validWorkspace, "apps/web/package.json": { name: "@acme/web", dependencies: "@acme/parcel" } })
+
+    try {
+      const file = nodePath.join(root, "apps/web/src/main.ts")
+      const messages: string[] = []
+      const context = {
+        filename: file,
+        options: [validConfig],
+        settings: {},
+        sourceCode: { text: readFileSync(file, "utf8") },
+        report: (diagnostic: { message: string }) => messages.push(diagnostic.message.split(":")[0] ?? ""),
+      }
+      depLintPlugin.rules.imports.create(context).Program()
+
+      expect(messages).toEqual(["undeclared-import"])
+      expect(checkWorkspace(root, validConfig).findings.map((finding) => `${finding.file} ${finding.rule}`)).toEqual([
+        "apps/web/src/main.ts undeclared-import",
+        "apps/web/package.json invalid-package",
+      ])
+    } finally {
+      removeWorkspace(root)
+    }
+  })
+})
