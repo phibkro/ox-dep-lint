@@ -119,7 +119,11 @@ describe("outside packages, runtime and test-only modules", () => {
         devDependencies: { "@acme/conformance": "workspace:*" },
       },
     }
-    expect(findingsWith({ ...declared, "services/room/src/party.ts": 'import "partyserver"\n' })).toEqual(["forbidden-external partyserver"])
+    // Once at the import, once where package.json declares it.
+    expect(findingsWith({ ...declared, "services/room/src/party.ts": 'import "partyserver"\n' })).toEqual([
+      "forbidden-external partyserver",
+      "forbidden-external partyserver",
+    ])
   })
 
   it("rejects runtime modules in shipped library code, bare built-ins included, and allows them in development files", () => {
@@ -157,9 +161,14 @@ describe("computed imports", () => {
     expect(findingsWith({ "apps/web/src/load.ts": "const name = './lazy.ts'\nexport const lazy = await import(name)\n" })).toEqual(["computed-import name"])
   })
 
-  it("treats a literal written with an escape as computed, closing the bypass that reads its text", () => {
+  it("checks a literal written with an escape by the module it spells, and reports the escape too", () => {
     const escaped = String.raw`export const parcel = await import("../../../libraries/parcel/src/\x73ize.ts")` + "\n"
-    expect(findingsWith({ "apps/web/src/escape.ts": escaped })).toEqual([String.raw`computed-import "../../../libraries/parcel/src/\x73ize.ts"`])
+    expect(findingsWith({ "apps/web/src/escape.ts": escaped })).toEqual([
+      String.raw`computed-import "../../../libraries/parcel/src/\x73ize.ts"`,
+      "relative-import-leaves-package ../../../libraries/parcel/src/size.ts",
+    ])
+    // In a development file the escape is allowed, but the edge it spells is still checked.
+    expect(findingsWith({ "apps/web/test/escape.test.ts": escaped })).toEqual(["relative-import-leaves-package ../../../libraries/parcel/src/size.ts"])
   })
 
   it("reports import.meta.glob as computed until globs are read", () => {

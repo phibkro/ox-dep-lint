@@ -12,7 +12,7 @@ describe("the specifier reader", () => {
     const source = [
       'import a from "a"',
       'import type { B } from "b"',
-      'import { type C, d } from "c"',
+      'import { type C } from "c"',
       'import "side-effect"',
       'export { e } from "e"',
       'export type { F } from "f"',
@@ -37,12 +37,16 @@ describe("the specifier reader", () => {
       String.raw`await import("./\x2e./y.ts")`,
       'import.meta.glob("./*.ts")',
     ].join("\n")
-    expect(read(source)).toEqual({ imports: [], computed: ["name", `\`./x${placeholder}.ts\``, String.raw`"./\x2e./y.ts"`, 'import.meta.glob("./*.ts")'] })
+    // The escaped literal is read by what it spells, and its escape is reported.
+    expect(read(source)).toEqual({
+      imports: ["./../y.ts"],
+      computed: ["name", `\`./x${placeholder}.ts\``, String.raw`"./\x2e./y.ts"`, 'import.meta.glob("./*.ts")'],
+    })
   })
 
   it("reads a static import written with an escape as computed too", () => {
     // Built from parts, so the escape survives any tool that normalises string literals.
     const escaped = ['"', "\\", 'u0066s"'].join("")
-    expect(read(`import ${escaped}`)).toEqual({ imports: [], computed: [escaped] })
+    expect(read(`import ${escaped}`)).toEqual({ imports: ["fs"], computed: [escaped] })
   })
 })

@@ -21,6 +21,8 @@ export interface Workspace {
   readonly byName: ReadonlyMap<string, WorkspacePackage>
   /** The root package's own dependency fields. */
   readonly rootManifest: Readonly<Record<ManifestField, readonly string[]>>
+  /** Members that cannot be checked: no name, a name another member has, an unreadable package.json. */
+  readonly problems: readonly { readonly directory: string; readonly message: string }[]
 }
 
 interface Manifest {
@@ -33,7 +35,13 @@ interface Manifest {
 }
 
 const readManifest = (path: string): Manifest => {
-  const parsed: unknown = JSON.parse(readFileSync(path, "utf8"))
+  let parsed: unknown
+
+  try {
+    parsed = JSON.parse(readFileSync(path, "utf8"))
+  } catch (cause) {
+    throw new Error(`${path}: ${cause instanceof Error ? cause.message : String(cause)}`, { cause })
+  }
 
   if (typeof parsed !== "object" || parsed === null) {
     throw new Error(`${path} is not a JSON object`)
@@ -42,7 +50,8 @@ const readManifest = (path: string): Manifest => {
   return parsed
 }
 
-const namesOf = (field: unknown): readonly string[] => (typeof field === "object" && field !== null ? Object.keys(field).toSorted() : [])
+const namesOf = (field: unknown): readonly string[] =>
+  typeof field === "object" && field !== null && !Array.isArray(field) ? Object.keys(field).toSorted() : []
 
 const fieldsOf = (manifest: Manifest): Record<ManifestField, readonly string[]> => ({
   dependencies: namesOf(manifest.dependencies),
@@ -65,21 +74,31 @@ const workspaceGlobs = (manifest: Manifest): readonly string[] | undefined => {
   return undefined
 }
 
-/** The nearest directory at or above `start` whose `package.json` declares `workspaces`. */
+const declaresWorkspaces = (manifest: string): boolean => {
+  try {
+    return workspaceGlobs(readManifest(manifest)) !== undefined
+  } catch {
+    return false
+  }
+}
+
+/**
+ * The outermost directory at or above `start` whose `package.json` declares `workspaces`. The outermost, so a member
+ * whose own manifest carries a stray `workspaces` key cannot make itself the root of an empty workspace.
+ */
 export const findWorkspaceRoot = (start: string): string | undefined => {
   let directory = nodePath.resolve(start)
+  let found: string | undefined
 
   for (;;) {
-    const manifest = nodePath.join(directory, "package.json")
-
-    if (existsSync(manifest) && workspaceGlobs(readManifest(manifest)) !== undefined) {
-      return directory
+    if (declaresWorkspaces(nodePath.join(directory, "package.json"))) {
+      found = directory
     }
 
     const parent = nodePath.dirname(directory)
 
     if (parent === directory) {
-      return undefined
+      return found
     }
 
     directory = parent
@@ -87,7 +106,7 @@ export const findWorkspaceRoot = (start: string): string | undefined => {
 }
 
 /** Directories under `root` (relative, `/`-separated) that a workspace glob names, skipping `node_modules` and dot directories. */
-const expand = (root: string, pattern: string): string[] => {
+export const directoriesMatching = (root: string, pattern: string): string[] => {
   const negated = pattern.startsWith("!")
   const clean = (negated ? pattern.slice(1) : pattern).replace(/^\.\//u, "").replace(/\/$/u, "")
   const fixed: string[] = []
@@ -139,7 +158,7 @@ export const loadWorkspace = (root: string): Workspace => {
   const directories = new Set<string>()
 
   for (const pattern of globs.filter((glob) => !glob.startsWith("!"))) {
-    for (const directory of expand(root, pattern)) {
+    for (const directory of directoriesMatching(root, pattern)) {
       if (existsSync(nodePath.join(root, directory, "package.json"))) {
         directories.add(directory)
       }
@@ -154,22 +173,38 @@ export const loadWorkspace = (root: string): Workspace => {
     }
   }
 
-  const packages = [...directories].toSorted().map((directory): WorkspacePackage => {
-    const manifest = readManifest(nodePath.join(root, directory, "package.json"))
+  const packages: WorkspacePackage[] = []
+  const problems: { directory: string; message: string }[] = []
+  const byName = new Map<string, WorkspacePackage>()
 
-    if (typeof manifest.name !== "string") {
-      throw new TypeError(`${directory}/package.json has no name`)
+  for (const directory of [...directories].toSorted()) {
+    let manifest: Manifest
+
+    try {
+      manifest = readManifest(nodePath.join(root, directory, "package.json"))
+    } catch (error) {
+      problems.push({ directory, message: `package.json cannot be read: ${error instanceof Error ? error.message : String(error)}` })
+      continue
     }
 
-    return { name: manifest.name, directory, manifest: fieldsOf(manifest) }
-  })
+    if (typeof manifest.name !== "string" || manifest.name === "") {
+      problems.push({ directory, message: "package.json has no name, so nothing can import it and its kind cannot be known" })
+      continue
+    }
 
-  return {
-    root,
-    packages,
-    byName: new Map(packages.map((entry) => [entry.name, entry])),
-    rootManifest: fieldsOf(rootManifest),
+    const other = byName.get(manifest.name)
+
+    if (other !== undefined) {
+      problems.push({ directory, message: `${manifest.name} is also the name of ${other.directory}` })
+      continue
+    }
+
+    const entry = { name: manifest.name, directory, manifest: fieldsOf(manifest) }
+    packages.push(entry)
+    byName.set(entry.name, entry)
   }
+
+  return { root, packages, byName, rootManifest: fieldsOf(rootManifest), problems }
 }
 
 /** The package whose directory holds the repository-relative `file`, the deepest one when packages nest. */

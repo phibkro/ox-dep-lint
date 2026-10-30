@@ -3,9 +3,12 @@
  * packages, packages no kind holds, and baseline entries no finding needs any more. Only the CLI runs these, because an
  * oxlint plugin sees one file at a time and never sees `package.json`.
  */
+import { existsSync } from "node:fs"
+import nodePath from "node:path"
 import type { ManifestField } from "./config.ts"
 import { baselineCovers, edgeRefusal } from "./engine.ts"
 import type { Engine, Finding } from "./engine.ts"
+import { directoriesMatching } from "./workspace.ts"
 
 const runtimeFields: readonly ManifestField[] = ["dependencies", "optionalDependencies", "peerDependencies"]
 
@@ -13,6 +16,30 @@ export const graphFindings = (engine: Engine): Finding[] => {
   const { config, workspace } = engine
   const findings: Finding[] = []
   const at = { line: 1, column: 0 }
+
+  for (const problem of workspace.problems) {
+    findings.push({ rule: "invalid-package", file: `${problem.directory}/package.json`, ...at, message: problem.message, target: problem.directory })
+  }
+
+  // A directory a kind names, with a package.json, that the workspace leaves out would otherwise go unchecked.
+  const members = new Set([...workspace.packages.map((entry) => entry.directory), ...workspace.problems.map((problem) => problem.directory)])
+
+  for (const kind of Object.values(config.kinds)) {
+    for (const pattern of kind.packages) {
+      for (const directory of directoriesMatching(workspace.root, pattern)) {
+        if (!members.has(directory) && existsSync(nodePath.join(workspace.root, directory, "package.json"))) {
+          members.add(directory)
+          findings.push({
+            rule: "package-outside-workspace",
+            file: `${directory}/package.json`,
+            ...at,
+            message: `${directory} is a package a kind names, but the root package.json's workspaces leave it out, so nothing in it is checked`,
+            target: directory,
+          })
+        }
+      }
+    }
+  }
 
   for (const entry of workspace.packages) {
     const manifest = `${entry.directory}/package.json`
@@ -26,6 +53,19 @@ export const graphFindings = (engine: Engine): Finding[] => {
         target: entry.name,
       })
       continue
+    }
+
+    const kindRule = config.kinds[engine.kindOf(entry) ?? ""]
+    const extra = config.packages[entry.name]?.externals ?? []
+
+    for (const field of config.imports.shippedFields) {
+      for (const name of entry.manifest[field]) {
+        const outside = !workspace.byName.has(name) && !config.workspaceScopes.some((scope) => name.startsWith(scope))
+
+        if (outside && kindRule !== undefined && kindRule.externals !== "any" && !kindRule.externals.includes(name) && !extra.includes(name)) {
+          findings.push({ rule: "forbidden-external", file: manifest, ...at, message: `${field} names ${name}, which its kind does not allow`, target: name })
+        }
+      }
     }
 
     for (const field of config.imports.manifestEdgeFields) {

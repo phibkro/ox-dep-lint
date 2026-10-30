@@ -1,9 +1,10 @@
 /** The oxlint rule and the CLI read one engine, so under real oxlint they must report the same per-file findings. */
 import { execFileSync } from "node:child_process"
-import { writeFileSync } from "node:fs"
+import { readFileSync, writeFileSync } from "node:fs"
 import nodePath from "node:path"
 import { describe, expect, it } from "vite-plus/test"
 import { checkWorkspace } from "../src/check.ts"
+import depLintPlugin from "../src/plugin.ts"
 import { removeWorkspace, validConfig, validWorkspace, writeWorkspace } from "./support/workspace.ts"
 
 const here = nodePath.dirname(new URL(import.meta.url).pathname)
@@ -56,4 +57,42 @@ describe("the oxlint plugin", () => {
       removeWorkspace(root)
     }
   }, 30_000)
+})
+
+describe("the plugin in a long-lived process", () => {
+  it("sees a file added and a dependency declared after its first run", async () => {
+    const root = writeWorkspace({
+      ...validWorkspace,
+      "apps/web/src/main.ts": 'import { helper } from "./helper.ts"\nimport x from "lodash"\nexport const w = [helper, x]\n',
+    })
+
+    try {
+      const file = nodePath.join(root, "apps/web/src/main.ts")
+      const lint = () => {
+        const messages: string[] = []
+        const context = {
+          filename: file,
+          options: [validConfig],
+          settings: {},
+          sourceCode: { text: readFileSync(file, "utf8") },
+          report: (diagnostic: { message: string }) => messages.push(diagnostic.message.split(":")[0] ?? ""),
+        }
+        depLintPlugin.rules.imports.create(context).Program()
+
+        return messages.toSorted()
+      }
+
+      expect(lint()).toEqual(["undeclared-import", "unresolved-import"])
+      writeFileSync(nodePath.join(root, "apps/web/src/helper.ts"), "export const helper = 1\n")
+      writeFileSync(
+        nodePath.join(root, "apps/web/package.json"),
+        JSON.stringify({ name: "@acme/web", dependencies: { "@acme/parcel": "workspace:*", lodash: "1" } }),
+      )
+      // The plugin looks for changed package.json files at most once a second.
+      await new Promise((resolve) => setTimeout(resolve, 1100))
+      expect(lint()).toEqual([])
+    } finally {
+      removeWorkspace(root)
+    }
+  })
 })

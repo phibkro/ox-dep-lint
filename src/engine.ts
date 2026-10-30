@@ -3,11 +3,11 @@
  * it over every file and adds the whole-graph checks (`graph.ts`), so the two never disagree. Rules adapted from the
  * module graph checks of phibkro/file-transfer, phibkro/vektorprogrammet-reimagined and reebeat/reebeat.
  */
-import { resolveConfig } from "./config.ts"
-import type { BaselineEntry, Config, FilePolicy, ResolvedConfig, RuleName } from "./config.ts"
+import { resolveConfig, packageOutput } from "./config.ts"
+import type { BaselineEntry, Config, FilePolicy, ManifestField, ResolvedConfig, RuleName } from "./config.ts"
 import { matchesAny } from "./glob.ts"
-import { makeResolver } from "./resolve.ts"
-import type { Resolve } from "./resolve.ts"
+import { makeResolver, withoutQuery } from "./resolve.ts"
+import type { Resolver } from "./resolve.ts"
 import { importForms } from "./specifiers.ts"
 import { loadWorkspace, packageOfFile } from "./workspace.ts"
 import type { Workspace, WorkspacePackage } from "./workspace.ts"
@@ -21,15 +21,21 @@ export interface Finding {
   readonly message: string
   /** The specifier or package the finding names, for baseline matching. */
   readonly target?: string
+  /** Offsets of the text the finding is about, in the source without a byte order mark. */
+  readonly start?: number
+  readonly end?: number
 }
 
 export interface Engine {
   readonly workspace: Workspace
   readonly config: ResolvedConfig
-  readonly resolve: Resolve
+  readonly resolver: Resolver
   /** The kind of a workspace package, or undefined when no kind's globs match its directory. */
   readonly kindOf: (entry: WorkspacePackage) => string | undefined
 }
+
+/** The source files the engine reads; anything else (`.vue`, `.json`) is no finding in either front end. */
+export const sourceFile = /\.[cm]?[jt]sx?$/u
 
 export const createEngine = (root: string, config: Config): Engine => {
   const resolved = resolveConfig(config)
@@ -37,32 +43,50 @@ export const createEngine = (root: string, config: Config): Engine => {
   const kinds = new Map<string, string | undefined>()
 
   for (const entry of workspace.packages) {
-    kinds.set(entry.name, Object.entries(resolved.kinds).find(([, kind]) => matchesAny(entry.directory, kind.packages))?.[0])
+    kinds.set(entry.directory, Object.entries(resolved.kinds).find(([, kind]) => matchesAny(entry.directory, kind.packages))?.[0])
   }
 
-  return { workspace, config: resolved, resolve: makeResolver(workspace, resolved), kindOf: (entry) => kinds.get(entry.name) }
+  return { workspace, config: resolved, resolver: makeResolver(workspace, resolved), kindOf: (entry) => kinds.get(entry.directory) }
 }
 
 /** The policy of a package-relative file: the first file class that matches, else shipped. */
 export const policyOf = (config: ResolvedConfig, packageRelative: string): FilePolicy =>
   config.fileClasses.find((fileClass) => matchesAny(packageRelative, fileClass.files))?.policy ?? "shipped"
 
-const shippedFields = ["dependencies", "peerDependencies", "optionalDependencies"] as const
+/** The policy a file is checked under: its class, with a package's test-support files counted as development files. */
+export const effectivePolicy = (engine: Engine, owner: WorkspacePackage, packageRelative: string): FilePolicy => {
+  const policy = policyOf(engine.config, packageRelative)
 
-/** Whether `entry` declares `name` where the file's policy needs it. */
-const declares = (workspace: Workspace, entry: WorkspacePackage, name: string, shipped: boolean): boolean => {
-  if (shippedFields.some((field) => entry.manifest[field].includes(name))) {
+  return policy === "shipped" && matchesAny(packageRelative, engine.config.packages[owner.name]?.testSupportFiles ?? []) ? "development" : policy
+}
+
+const article = (word: string) => (/^[aeiou]/iu.test(word) ? `an ${word}` : `a ${word}`)
+
+/** Whether `entry` declares `name` in `fields`, or (when `anywhere`) in any field of its own or the root's. */
+const declares = (engine: Engine, entry: WorkspacePackage, name: string, anywhere: boolean): boolean => {
+  const fields: readonly ManifestField[] = engine.config.imports.shippedFields
+
+  if (fields.some((field) => entry.manifest[field].includes(name))) {
     return true
   }
 
-  return !shipped && (entry.manifest.devDependencies.includes(name) || Object.values(workspace.rootManifest).some((names) => names.includes(name)))
+  return (
+    anywhere &&
+    (Object.values(entry.manifest).some((names) => names.includes(name)) || Object.values(engine.workspace.rootManifest).some((names) => names.includes(name)))
+  )
 }
 
 /** `@types/scope__name` for `@scope/name`, `@types/name` for `name`. */
 const typesPackage = (name: string) => `@types/${name.startsWith("@") ? name.slice(1).replace("/", "__") : name}`
 
-/** Why `from` (of kind `kind`) may not import workspace package `to`, or undefined when it may. */
-export const edgeRefusal = (engine: Engine, from: WorkspacePackage, to: WorkspacePackage, typeOnly: boolean): { rule: RuleName; why: string } | undefined => {
+/** Why `from` may not import workspace package `to` (written as `specifier`), or undefined when it may. */
+export const edgeRefusal = (
+  engine: Engine,
+  from: WorkspacePackage,
+  to: WorkspacePackage,
+  typeOnly: boolean,
+  specifier?: string,
+): { rule: RuleName; why: string } | undefined => {
   const kind = engine.kindOf(from)
   const targetKind = engine.kindOf(to)
   const refinements = engine.config.packages[from.name]
@@ -72,13 +96,15 @@ export const edgeRefusal = (engine: Engine, from: WorkspacePackage, to: Workspac
   }
 
   if (refinements?.typeOnlyUses?.includes(to.name) === true) {
-    return typeOnly ? undefined : { rule: "type-only-edge", why: `${from.name} may import ${to.name} only with type-only imports` }
+    const valueAllowed = specifier !== undefined && matchesAny(specifier, refinements.valueSpecifiers ?? [])
+
+    return typeOnly || valueAllowed ? undefined : { rule: "type-only-edge", why: `${from.name} may import ${to.name} only with import type or export type` }
   }
 
   const rule = engine.config.kinds[kind]
 
   if (rule !== undefined && rule.mayUse !== "any" && !rule.mayUse.includes(targetKind)) {
-    return { rule: "forbidden-edge", why: `a ${kind} package may not import ${to.name}, a ${targetKind}` }
+    return { rule: "forbidden-edge", why: `${article(kind)} package may not import ${to.name}, ${article(targetKind)}` }
   }
 
   if (refinements?.uses !== undefined && !refinements.uses.includes(to.name)) {
@@ -88,22 +114,28 @@ export const edgeRefusal = (engine: Engine, from: WorkspacePackage, to: Workspac
   return undefined
 }
 
+/** Whether the engine reads `file` at all: a source file of a workspace package, not ignored, not build output. */
+export const reads = (engine: Engine, file: string): boolean => {
+  if (!sourceFile.test(file) || matchesAny(file, engine.config.ignore)) {
+    return false
+  }
+
+  const owner = packageOfFile(engine.workspace, file)
+
+  return owner !== undefined && !matchesAny(file.slice(owner.directory.length + 1), packageOutput)
+}
+
 /** Every finding for one file, before the baseline. `file` is repository-relative and `text` is its source. */
 export const findingsForFile = (engine: Engine, file: string, text: string): Finding[] => {
   const { config, workspace } = engine
-
-  if (matchesAny(file, config.ignore)) {
-    return []
-  }
-
   const owner = packageOfFile(workspace, file)
 
-  if (owner === undefined) {
+  if (owner === undefined || !reads(engine, file)) {
     return []
   }
 
   const packageRelative = file.slice(owner.directory.length + 1)
-  const policy = policyOf(config, packageRelative)
+  const policy = effectivePolicy(engine, owner, packageRelative)
 
   if (policy === "unchecked") {
     return []
@@ -112,8 +144,12 @@ export const findingsForFile = (engine: Engine, file: string, text: string): Fin
   const findings: Finding[] = []
   const kind = engine.kindOf(owner)
 
-  const report = (rule: RuleName, place: { line: number; column: number }, message: string, target?: string) => {
-    findings.push(target === undefined ? { rule, file, ...place, message } : { rule, file, ...place, message, target })
+  const report = (rule: RuleName, place: { line: number; column: number; start?: number; end?: number }, message: string, target?: string) => {
+    const where =
+      place.start === undefined || place.end === undefined
+        ? { line: place.line, column: place.column }
+        : { line: place.line, column: place.column, start: place.start, end: place.end }
+    findings.push(target === undefined ? { rule, file, ...where, message } : { rule, file, ...where, message, target })
   }
 
   if (kind === undefined) {
@@ -124,12 +160,11 @@ export const findingsForFile = (engine: Engine, file: string, text: string): Fin
 
   const kindRule = config.kinds[kind]
   const refinements = config.packages[owner.name]
-  // A test-support file ships as a source of tests (a conformance suite's entry): it is checked as a development file.
-  const shipped = policy === "shipped" && !matchesAny(packageRelative, refinements?.testSupportFiles ?? [])
+  const shipped = policy === "shipped"
   const forms = importForms(file, text)
 
   for (const message of forms.parseErrors) {
-    report("parse-error", { line: 1, column: 0 }, `could not be parsed, so its imports cannot be checked: ${message}`)
+    report("parse-error", { line: 1, column: 0 }, `could not be parsed, so its imports cannot be checked: ${message}`, "parse")
   }
 
   for (const site of forms.computed) {
@@ -139,8 +174,9 @@ export const findingsForFile = (engine: Engine, file: string, text: string): Fin
   }
 
   for (const site of forms.imports) {
-    const { specifier, typeOnly } = site
-    const target = engine.resolve(file, specifier)
+    const { typeOnly } = site
+    const specifier = withoutQuery(site.specifier)
+    const target = engine.resolver.resolve(file, site.specifier)
 
     if (shipped && matchesAny(specifier, config.testOnlySpecifiers)) {
       report("test-only-in-shipped", site, `shipped code imports the test-only ${specifier}`, specifier)
@@ -148,15 +184,24 @@ export const findingsForFile = (engine: Engine, file: string, text: string): Fin
 
     switch (target.kind) {
       case "runtime": {
-        if (shipped && kindRule?.runtimeModules === false) {
-          report("runtime-module", site, `imports the runtime module ${specifier}, which a ${kind} package may not use in shipped code`, specifier)
+        if (shipped && !typeOnly && kindRule?.runtimeModules === false) {
+          report("runtime-module", site, `imports the runtime module ${specifier}, which ${article(kind)} package may not use in shipped code`, specifier)
         }
 
         break
       }
 
+      case "virtual": {
+        break
+      }
+
       case "unknown-workspace": {
         report("unknown-workspace-package", site, `${target.name} is not a workspace package`, target.name)
+        break
+      }
+
+      case "dotted": {
+        report("package-path-escape", site, `${specifier} walks out of ${target.name} with . or ..; import the package you mean by its name`, specifier)
         break
       }
 
@@ -169,23 +214,23 @@ export const findingsForFile = (engine: Engine, file: string, text: string): Fin
 
         if (to.name === owner.name) {
           if (config.imports.selfByName === "error") {
-            report("self-import-by-name", site, `imports its own package by its name; use a relative path`, specifier)
+            report("self-import-by-name", site, "imports its own package by its name; use a relative path", specifier)
           }
 
           break
         }
 
-        const refusal = edgeRefusal(engine, owner, to, typeOnly)
+        const refusal = edgeRefusal(engine, owner, to, typeOnly, specifier)
 
         if (refusal !== undefined) {
           report(refusal.rule, site, refusal.why, to.name)
         }
 
-        if (config.imports.requireDeclared && !declares(workspace, owner, to.name, shipped)) {
+        if (config.imports.requireDeclared && !declares(engine, owner, to.name, !shipped || typeOnly)) {
           report(
             "undeclared-import",
             site,
-            `imports ${to.name}, which ${owner.directory}/package.json does not declare${shipped ? " in dependencies" : ""}`,
+            `imports ${to.name}, which ${owner.directory}/package.json does not declare${shipped ? " for shipped code" : ""}`,
             to.name,
           )
         }
@@ -197,15 +242,22 @@ export const findingsForFile = (engine: Engine, file: string, text: string): Fin
         const to = packageOfFile(workspace, target.path)
 
         if (to?.name !== owner.name) {
-          const where = to === undefined ? "outside every package" : `into ${to.name}`
+          const where = to === undefined ? "a file outside every package" : `into ${to.name}`
           report("relative-import-leaves-package", site, `${specifier} reaches ${where}; import a package by its name`, specifier)
+        } else if (shipped && !typeOnly && effectivePolicy(engine, owner, target.path.slice(owner.directory.length + 1)) !== "shipped") {
+          report(
+            "shipped-imports-development-file",
+            site,
+            `shipped code imports ${specifier}, a development file, which may use what shipped code may not; move what it needs into shipped code`,
+            specifier,
+          )
         }
 
         break
       }
 
       case "outside": {
-        report("relative-import-leaves-package", site, `${specifier} reaches outside the repository`, specifier)
+        report("relative-import-leaves-package", site, `${specifier} reaches ${target.where}`, specifier)
         break
       }
 
@@ -220,18 +272,23 @@ export const findingsForFile = (engine: Engine, file: string, text: string): Fin
       case "external": {
         const allowed = kindRule?.externals
         const extra = refinements?.externals ?? []
+        const permitted = (name: string) => allowed === "any" || allowed?.includes(name) === true || extra.includes(name)
 
-        if (shipped && allowed !== undefined && allowed !== "any" && !allowed.includes(target.name) && !extra.includes(target.name)) {
-          report("forbidden-external", site, `a ${kind} package may not import ${target.name} in shipped code`, target.name)
+        if (shipped && !typeOnly && !permitted(target.name)) {
+          report("forbidden-external", site, `${article(kind)} package may not import ${target.name} in shipped code`, target.name)
         }
 
-        const declared = declares(workspace, owner, target.name, shipped) || (typeOnly && declares(workspace, owner, typesPackage(target.name), shipped))
+        const anywhere = !shipped || typeOnly
+        const declared =
+          declares(engine, owner, target.name, anywhere) ||
+          declares(engine, owner, target.written, anywhere) ||
+          (typeOnly && declares(engine, owner, typesPackage(target.name), true))
 
         if (config.imports.requireDeclared && !declared) {
           report(
             "undeclared-import",
             site,
-            `imports ${target.name}, which ${owner.directory}/package.json does not declare${shipped ? " in dependencies" : ""}`,
+            `imports ${target.name}, which ${owner.directory}/package.json does not declare${shipped ? " for shipped code" : ""}`,
             target.name,
           )
         }
@@ -246,7 +303,7 @@ export const findingsForFile = (engine: Engine, file: string, text: string): Fin
 
 /** Whether `entry` covers `finding`. */
 export const baselineCovers = (entry: BaselineEntry, finding: Finding): boolean =>
-  entry.file === finding.file && entry.rule === finding.rule && (entry.target === undefined || entry.target === finding.target)
+  entry.file === finding.file && entry.rule === finding.rule && entry.target === finding.target
 
 /** `findings` less those the baseline covers. */
 export const withoutBaselined = (engine: Engine, findings: readonly Finding[]): Finding[] =>
