@@ -152,7 +152,7 @@ export const reads = (engine: Engine, file: string): boolean => {
 }
 
 /** Whether `glob` matches every path under `directory`: it is `**`, or it or a directory above it matches what comes before a trailing `/**`. */
-const coversDirectory = (glob: string, directory: string): boolean => {
+export const coversDirectory = (glob: string, directory: string): boolean => {
   if (glob === "**") {
     return true
   }
@@ -237,6 +237,15 @@ export const skipsDirectory = (engine: Engine, directory: string): boolean => {
 
   return false
 }
+
+/** Directories the walk never enters, wherever they are: dependencies and git's own data. */
+export const passedOver = (name: string): boolean => name === "node_modules" || name === ".git"
+
+/**
+ * Whether a symbolic link at the repository-relative `path` is a finding: always, whatever it points at, unless it lies
+ * in (or is) a directory the check skips on purpose (`node_modules`, `.git`, or one `skipsDirectory` covers).
+ */
+export const reportsLink = (engine: Engine, path: string): boolean => !path.split("/").some(passedOver) && !skipsDirectory(engine, path)
 
 /** A symbolic link the check met and did not follow, at `path` (repository-relative), with the destination it names. */
 export const symbolicLinkFinding = (path: string, destination: string): Finding => ({
@@ -371,7 +380,18 @@ export const findingsForFile = (engine: Engine, file: string, text: string, opti
   const owner = packageOfFile(workspace, file)
 
   // A file the check does not read (build output, an ignored path) is still judged when shipped code imports it.
-  if (owner === undefined || !sourceFile.test(file) || (!reads(engine, file) && developmentImports === undefined)) {
+  if (owner === undefined || !sourceFile.test(file)) {
+    return []
+  }
+
+  // Reached through a symbolic link (only oxlint does that): the link is the finding, and nothing behind it is read.
+  const link = linkOnPath(engine, owner, file)
+
+  if (link !== undefined) {
+    return reportsLink(engine, link) ? [symbolicLinkFinding(link, linkDestination(nodePath.join(workspace.root, link)))] : []
+  }
+
+  if (!reads(engine, file) && developmentImports === undefined) {
     return []
   }
 
@@ -381,13 +401,6 @@ export const findingsForFile = (engine: Engine, file: string, text: string, opti
 
   if (policy === "unchecked") {
     return []
-  }
-
-  // Reached through a symbolic link (only oxlint does that): the link is the finding, and nothing behind it is read.
-  const link = linkOnPath(engine, owner, file)
-
-  if (link !== undefined) {
-    return [symbolicLinkFinding(link, linkDestination(nodePath.join(workspace.root, link)))]
   }
 
   const findings: Finding[] = []

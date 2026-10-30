@@ -2,11 +2,11 @@
  * The workspace as `package.json` files declare it: the root's `workspaces` globs, and each package's real name (never
  * guessed from its directory) and dependency fields.
  */
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs"
+import { existsSync, lstatSync, readdirSync, readFileSync, statSync } from "node:fs"
 import nodePath from "node:path"
 import type { ManifestField } from "./config.ts"
 import { matchesGlob } from "./glob.ts"
-import { attempt, failure, messageOf, success } from "./result.ts"
+import { attempt, codeOf, failure, messageOf, success } from "./result.ts"
 import type { Result } from "./result.ts"
 
 export interface WorkspacePackage {
@@ -146,11 +146,24 @@ export const findWorkspaceRoot = (start: string): string | undefined => {
   }
 }
 
+const isSymbolicLink = (absolute: string): boolean => {
+  const status = attempt(() => lstatSync(absolute))
+
+  return status.ok && status.value.isSymbolicLink()
+}
+
+/** What `directoriesMatching` met and did not descend into: symbolic links the pattern matches, and directories it could not list. */
+export interface Unlisted {
+  readonly links: string[]
+  readonly unreadable: { readonly directory: string; readonly code: string }[]
+}
+
 /**
  * The directories under `root` that `pattern` matches, skipping `node_modules` and dot directories. A symbolic link is
- * never followed; with `links`, each one the pattern matches is collected there.
+ * never followed, not even one the pattern names literally, and a directory that cannot be listed is passed over; with
+ * `unlisted`, both are collected there, so the caller can report them.
  */
-export const directoriesMatching = (root: string, pattern: string, links?: string[]): string[] => {
+export const directoriesMatching = (root: string, pattern: string, unlisted?: Unlisted): string[] => {
   const negated = pattern.startsWith("!")
   const clean = (negated ? pattern.slice(1) : pattern).replace(/^\.\//u, "").replace(/\/$/u, "")
   const fixed: string[] = []
@@ -176,20 +189,32 @@ export const directoriesMatching = (root: string, pattern: string, links?: strin
       return
     }
 
-    const absolute = nodePath.join(root, relative)
+    const listed = attempt(() => readdirSync(nodePath.join(root, relative), { withFileTypes: true }))
 
-    for (const entry of readdirSync(absolute, { withFileTypes: true })) {
+    if (!listed.ok) {
+      unlisted?.unreadable.push({ directory: relative, code: codeOf(listed.error) })
+
+      return
+    }
+
+    for (const entry of listed.value) {
       const path = relative === "" ? entry.name : `${relative}/${entry.name}`
 
       if (entry.isDirectory() && entry.name !== "node_modules" && !entry.name.startsWith(".")) {
         walk(path, depth + 1)
-      } else if (entry.isSymbolicLink() && links !== undefined && matchesGlob(path, clean)) {
-        links.push(path)
+      } else if (entry.isSymbolicLink() && matchesGlob(path, clean)) {
+        unlisted?.links.push(path)
       }
     }
   }
 
   if (base === clean) {
+    if (isSymbolicLink(nodePath.join(root, base))) {
+      unlisted?.links.push(base)
+
+      return []
+    }
+
     return existsSync(nodePath.join(root, base)) ? [base] : []
   }
 

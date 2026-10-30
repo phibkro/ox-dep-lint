@@ -103,7 +103,32 @@ describe("symbolic links under a package's checked files", () => {
     }
   })
 
-  it("negative control: a link where the check reads nothing is no finding", () => {
+  it("reports a link whatever it points at or is named, in a dot directory too", () => {
+    const config: Config = { ...validConfig, fileClasses: [{ files: ["**/*.d.ts"], policy: "unchecked" }, ...defaultFileClasses] }
+    expect(
+      check(
+        elsewhere,
+        {
+          "libraries/parcel/src/types.d.ts": "../../../elsewhere/b.ts",
+          "libraries/parcel/README.md": "../../elsewhere/b.ts",
+          "libraries/parcel/data.json": "../../elsewhere/b.ts",
+          "libraries/parcel/LICENSE": "../../elsewhere/b.ts",
+          "libraries/parcel/.cache": "../../elsewhere",
+          "libraries/parcel/src/.internal/linked.ts": "../../../../elsewhere/b.ts",
+        },
+        config,
+      ),
+    ).toEqual([
+      "symbolic-link libraries/parcel/.cache ../../elsewhere",
+      "symbolic-link libraries/parcel/LICENSE ../../elsewhere/b.ts",
+      "symbolic-link libraries/parcel/README.md ../../elsewhere/b.ts",
+      "symbolic-link libraries/parcel/data.json ../../elsewhere/b.ts",
+      "symbolic-link libraries/parcel/src/.internal/linked.ts ../../../../elsewhere/b.ts",
+      "symbolic-link libraries/parcel/src/types.d.ts ../../../elsewhere/b.ts",
+    ])
+  })
+
+  it("negative control: a link in a directory the check skips on purpose is no finding", () => {
     const config: Config = {
       ...validConfig,
       ignore: ["libraries/parcel/vendor/**"],
@@ -113,12 +138,11 @@ describe("symbolic links under a package's checked files", () => {
       check(
         elsewhere,
         {
-          // Build output, a dependency, a dot directory, a file the check never reads, an ignored path, unchecked files.
+          // Build output, dependencies, git's data, an ignored directory, unchecked files.
           "libraries/parcel/dist/index.js": "../../../elsewhere/b.ts",
           "libraries/parcel/dist/chunks": "../../../elsewhere",
           "libraries/parcel/node_modules": "../../elsewhere",
-          "libraries/parcel/.cache": "../../elsewhere",
-          "libraries/parcel/README.md": "../../elsewhere/b.ts",
+          "libraries/parcel/.git/hooks": "../../../elsewhere",
           "libraries/parcel/vendor/b.ts": "../../../elsewhere/b.ts",
           "libraries/parcel/vendor/all": "../../../elsewhere",
           "libraries/parcel/fixtures/b.ts": "../../../elsewhere/b.ts",
@@ -145,6 +169,18 @@ describe("symbolic links under a package's checked files", () => {
   })
 })
 
+describe("dot directories", () => {
+  it("checks the sources in a dot directory, and skips only .git and node_modules", () => {
+    expect(
+      check({
+        [`${source}/.internal/x.ts`]: 'import "@acme/platform-cloudflare"\n',
+        "libraries/parcel/.git/hooks/x.ts": 'import "@acme/platform-cloudflare"\n',
+        "libraries/parcel/node_modules/x/index.ts": 'import "@acme/platform-cloudflare"\n',
+      }),
+    ).toEqual([`forbidden-edge ${source}/.internal/x.ts @acme/platform-cloudflare`, `undeclared-import ${source}/.internal/x.ts @acme/platform-cloudflare`])
+  })
+})
+
 describe("directories the walk cannot read", () => {
   it("reports a directory it cannot list instead of skipping it or failing", () => {
     expect(
@@ -160,6 +196,33 @@ describe("directories the walk cannot read", () => {
         denied.add(nodePath.join(root, "libraries/parcel/dist"))
       }),
     ).toEqual([])
+  })
+
+  it("reports a directory a workspaces glob cannot list, and the glob's base, instead of failing", () => {
+    const root = { ...(validWorkspace["package.json"] as object), workspaces: ["libraries/**", "services/*", "platforms/*", "apps/*", "tools/*", "extras/*"] }
+    expect(
+      check(
+        {
+          "package.json": root,
+          [`${source}/locked/c.ts`]: "export {}\n",
+          "libraries/stray/locked/c.ts": "export {}\n",
+          "libraries/attic/locked/c.ts": "export {}\n",
+          "extras/one/c.ts": "export {}\n",
+        },
+        {},
+        { ...validConfig, ignore: ["libraries/attic/**"] },
+        (workspace) => {
+          for (const directory of [`${source}/locked`, "libraries/stray/locked", "libraries/attic/locked", "extras"]) {
+            denied.add(nodePath.join(workspace, directory))
+          }
+        },
+      ),
+    ).toEqual([
+      "directory-without-package libraries/stray libraries/stray",
+      "unreadable-directory extras extras",
+      // Inside a member, once: the walk reports it, and the glob leaves it to the walk.
+      `unreadable-directory ${source}/locked ${source}/locked`,
+    ])
   })
 
   it("reports a directory whose mode forbids reading it (chmod 000)", (context) => {
@@ -222,6 +285,55 @@ describe("directories the workspaces match that no package owns", () => {
         config,
       ),
     ).toEqual([])
+  })
+
+  it("under a ** glob, leaves links in a member to the walk: once, and not where it skips", () => {
+    const root = { ...(validWorkspace["package.json"] as object), workspaces: ["libraries/**", "services/*", "platforms/*", "apps/*", "tools/*"] }
+    const config: Config = { ...validConfig, fileClasses: [{ files: ["fixtures/**"], policy: "unchecked" }, ...defaultFileClasses] }
+    expect(
+      check(
+        { ...elsewhere, "package.json": root },
+        {
+          [`${source}/link`]: "../../../elsewhere",
+          "libraries/parcel/dist/link": "../../../elsewhere",
+          "libraries/parcel/fixtures/link": "../../../elsewhere",
+          "libraries/parcel/test/link": "../../../elsewhere",
+          "libraries/parcel/node_modules": "../../elsewhere",
+          "libraries/node_modules": "../elsewhere",
+          "libraries/linked": "../elsewhere",
+        },
+        config,
+      ),
+    ).toEqual([
+      "symbolic-link libraries/linked ../elsewhere",
+      `symbolic-link ${source}/link ../../../elsewhere`,
+      "symbolic-link libraries/parcel/test/link ../../../elsewhere",
+    ])
+  })
+
+  it("reports a link a workspaces entry names literally, and does not follow it", () => {
+    const root = {
+      ...(validWorkspace["package.json"] as object),
+      workspaces: ["libraries/*", "services/*", "platforms/*", "apps/*", "tools/*", "extras/linked"],
+    }
+    expect(check({ ...elsewhere, "elsewhere/package.json": { name: "@acme/elsewhere" }, "package.json": root }, { "extras/linked": "../elsewhere" })).toEqual([
+      "symbolic-link extras/linked ../elsewhere",
+    ])
+  })
+
+  it("reports only the topmost of nested directories no package owns", () => {
+    const root = { ...(validWorkspace["package.json"] as object), workspaces: ["libraries/**", "services/*", "platforms/*", "apps/*", "tools/*"] }
+    expect(
+      check({ "package.json": root }, {}, validConfig, (workspace) => mkdirSync(nodePath.join(workspace, "libraries/empty/a/b"), { recursive: true })),
+    ).toEqual(["directory-without-package libraries/empty libraries/empty"])
+  })
+
+  it("negative control: a negated glob ending in /** leaves the directory itself out", () => {
+    const root = {
+      ...(validWorkspace["package.json"] as object),
+      workspaces: ["libraries/*", "services/*", "platforms/*", "apps/*", "tools/*", "!tools/legacy/**"],
+    }
+    expect(check({ "package.json": root, "tools/legacy/old.ts": "export {}\n" })).toEqual([])
   })
 
   it("can be baselined, and a baseline entry no directory needs is stale", () => {

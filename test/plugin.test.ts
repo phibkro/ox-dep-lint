@@ -15,6 +15,8 @@ const violations = {
   "services/room/src/index.ts": 'import "@acme/platform-cloudflare"\nexport * from "@acme/service-quota"\nexport const lazy = await import(`./x${1}.ts`)\n',
   "libraries/parcel/src/runtime.ts": 'import { readFileSync } from "fs"\nimport "./missing.ts"\nexport const read = readFileSync\n',
   "apps/web/src/main.ts": 'import "../../../libraries/parcel/src/size.ts"\nimport "fast-check"\n',
+  // A dot directory: both front ends read it.
+  "libraries/parcel/src/.internal/x.ts": 'import "@acme/platform-cloudflare"\n',
 }
 
 const lintedFindings = (root: string): string[] => {

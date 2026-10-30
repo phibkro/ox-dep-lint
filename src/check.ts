@@ -1,14 +1,15 @@
 /** The whole check: every source file of the workspace through the engine, plus the whole-graph checks and the baseline. */
-import { readdirSync, readFileSync, statSync } from "node:fs"
+import { readdirSync, readFileSync } from "node:fs"
 import type { Dirent } from "node:fs"
 import nodePath from "node:path"
 import type { Config } from "./config.ts"
 import {
   createEngine,
-  effectivePolicy,
   findingsForFile,
   linkDestination,
+  passedOver,
   reads,
+  reportsLink,
   skipsDirectory,
   symbolicLinkFinding,
   unreadableDirectoryFinding,
@@ -17,50 +18,25 @@ import {
 import type { Engine, Finding } from "./engine.ts"
 import { graphFindings, staleBaseline } from "./graph.ts"
 import { codeOf } from "./result.ts"
-import { packageOfFile } from "./workspace.ts"
-
-/** What a symbolic link names: a file (anything that is not a directory), a directory, or nothing it can reach (dangling, a cycle). */
-const destinationKind = (absolute: string): "file" | "directory" | "unreachable" => {
-  try {
-    return statSync(absolute).isDirectory() ? "directory" : "file"
-  } catch {
-    return "unreachable"
-  }
-}
 
 /** The source files of the workspace's packages, and what kept the walk from seeing all of them. */
 export interface SourceWalk {
   readonly files: readonly string[]
-  /** A `symbolic-link` finding for each link where the check would read, an `unreadable-directory` one for each directory it could not list. */
+  /** A `symbolic-link` finding for each link outside the directories it skips, an `unreadable-directory` one for each directory it could not list. */
   readonly findings: readonly Finding[]
 }
 
 /**
- * Every source file the engine reads, found by walking each package's directory (skipping `node_modules` and dot
- * directories). A walk rather than `git ls-files`: generated and gitignored sources still ship, and a nested repository
- * or submodule inside a package is still part of it. A symbolic link is never followed: one where the check would read
- * (a file link it would read, or a directory, dangling or cyclic link under a directory it does not skip) is a finding,
- * and so is a directory it cannot list.
+ * Every source file the engine reads, found by walking each package's directory (skipping `node_modules` and `.git`;
+ * other dot directories hold sources too). A walk rather than `git ls-files`: generated and gitignored sources still
+ * ship, and a nested repository or submodule inside a package is still part of it. A symbolic link is never followed:
+ * every one is a finding, whatever it points at, unless it lies in a directory the check skips on purpose; and so is a
+ * directory the walk cannot list.
  */
 export const walkSources = (engine: Engine): SourceWalk => {
   const files = new Set<string>()
   const findings = new Map<string, Finding>()
   const { root } = engine.workspace
-  const hidden = (name: string) => name === "node_modules" || name.startsWith(".")
-
-  const symbolicLink = (path: string, name: string) => {
-    const absolute = nodePath.join(root, path)
-    const owner = packageOfFile(engine.workspace, path)
-    const kind = destinationKind(absolute)
-    const read =
-      kind === "file"
-        ? owner !== undefined && reads(engine, path) && effectivePolicy(engine, owner, path.slice(owner.directory.length + 1)) !== "unchecked"
-        : !hidden(name) && !skipsDirectory(engine, path)
-
-    if (read) {
-      findings.set(path, symbolicLinkFinding(path, linkDestination(absolute)))
-    }
-  }
 
   const walk = (relative: string) => {
     let entries: Dirent[]
@@ -79,11 +55,13 @@ export const walkSources = (engine: Engine): SourceWalk => {
       const path = `${relative}/${entry.name}`
 
       if (entry.isDirectory()) {
-        if (!hidden(entry.name)) {
+        if (!passedOver(entry.name)) {
           walk(path)
         }
       } else if (entry.isSymbolicLink()) {
-        symbolicLink(path, entry.name)
+        if (reportsLink(engine, path)) {
+          findings.set(path, symbolicLinkFinding(path, linkDestination(nodePath.join(root, path))))
+        }
       } else if (entry.isFile() && reads(engine, path)) {
         files.add(path)
       }
