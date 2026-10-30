@@ -21,4 +21,4 @@ jobs:
       - run: bun run build
       # The tarball must carry the built files (0.1.0 went out without them).
       - name: The package holds dist
-        run: npm pack --dry-run --json | node -e 'const [pack] = JSON.parse(require("fs").readFileSync(0, "utf8")); for (const file of ["dist/cli.mjs", "dist/index.mjs", "dist/plugin.mjs", "dist/index.d.mts"]) { if (!pack.files.some((entry) => entry.path === file)) { console.error(`missing ${file}`); process.exit(1) } }'
+        run: npm pack --dry-run --json --ignore-scripts | node -e 'const [pack] = JSON.parse(require("fs").readFileSync(0, "utf8")); for (const file of ["dist/cli.mjs", "dist/index.mjs", "dist/plugin.mjs", "dist/index.d.mts"]) { if (!pack.files.some((entry) => entry.path === file)) { console.error(`missing ${file}`); process.exit(1) } }'
