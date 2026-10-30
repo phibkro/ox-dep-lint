@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.0
+
+### Minor Changes
+
+- e75db50: Sources under a workspace glob no longer escape the check unreported: each one is read, or the reason it cannot be read is a finding. Plain files at a glob's level (`packages/x.ts`, outside every package directory) and entries that are neither files, directories nor links (FIFOs, sockets) are still not reported. This can add findings to a repository that passed before, so upgrade with the CLI once and baseline or fix what it reports.
+
+  - The walk now reads dot directories inside a package (`src/.internal/x.ts`), as oxlint already did; it skips only `node_modules` and `.git`.
+  - `output` now defaults to `dist/**`, `coverage/**` and the caches tools write at a package root: `.wrangler/**`, `.astro/**`, `.svelte-kit/**`, `.next/**`, `.turbo/**`, `.vercel/**`, `.nuxt/**`, `.output/**`. Setting `output` replaces the defaults; it does not add to them.
+  - `symbolic-link`: every symbolic link under a package directory, whatever it points at and whatever its name (`.d.ts`, `.md`, `.json`, extensionless); a link a `workspaces` or kind glob matches or names literally; and a link a glob passes through (`packages` itself a link). Links are never followed: 0.2 read a link to a file as if it were the file, skipped a link to a directory silently, and followed a linked `packages`. Only links inside directories the check skips on purpose are not reported: `node_modules`, `.git`, and directories that `ignore`, `output` or an unchecked file class cover through a trailing `/**`. A baseline entry names the link as `file` and its destination, as written, as `target`; baselined or not, what a link points at is never read. A Nix `result` link inside a package is a finding; `ignore: ["**/result/**"]` clears it. The oxlint plugin reports it on each file oxlint reaches through a link and reads nothing else in that file.
+  - `unreadable-path`: a directory the walk, a `workspaces` glob or a kind's glob cannot list, or a source file the check cannot read (`EACCES`), unless the check skips it on purpose. 0.2 stopped with exit code 2 and the error instead.
+  - `directory-without-package`: a directory a root `workspaces` glob matches that has no `package.json` and lies neither inside nor above a member, so nothing checks its files; and a dot directory such a glob would match (`packages/.template`), with or without a `package.json`, since npm and Bun workspaces never match dot directories. Only the topmost of nested ones is reported, and a negated glob (`!tools/legacy` or `!tools/legacy/**`) leaves it out. No new configuration key: add `dir/**` to `ignore`, or baseline it, to keep one.
+
+  A workspaces entry or kind glob that names or passes through a symbolic link no longer finds packages there: the link is reported instead of followed. `listSourceFiles` no longer lists a file reached through a link; the new `walkSources` returns the files with the walk's findings. `Workspace` has a new field, `globs`, the root's `workspaces` globs.
+
 ## 0.3.0
 
 ### Minor Changes
